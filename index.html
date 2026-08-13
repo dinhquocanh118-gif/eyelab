@@ -5135,7 +5135,7 @@ function AoiEditor({stimulus,onChange}){
 function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
   const containerRef=useRef(null),mediaStageRef=useRef(null),videoRef=useRef(null),imgRef=useRef(null),dotRef=useRef(null);
   const gazeBufferRef=useRef([]),startTimeRef=useRef(0),isRecordingRef=useRef(false),aoisRef=useRef([]),stimTypeRef=useRef('image'),stimDurationMsRef=useRef(0),imageTimerRef=useRef(null),finalizedRef=useRef(false),advanceLockRef=useRef(false),currentSeqIdxRef=useRef(-1),sequenceRef=useRef([]),startCurrentStimulusRef=useRef(null);
-  const qualityRef=useRef({total:0,valid:0}),quickValidationRef=useRef({active:false,samples:[],nextIdx:null,block:null,start:0}),surveyLoadCountRef=useRef(0),surveyStartedAtRef=useRef(0),surveyCompletionLockRef=useRef(false);
+  const qualityRef=useRef({total:0,valid:0}),quickValidationRef=useRef({active:false,samples:[],nextIdx:null,block:null,start:0}),surveyLoadCountRef=useRef(0),surveyStartedAtRef=useRef(0),surveyCompletionLockRef=useRef(false),gazeHandlerRef=useRef(null),lastGazeCallbackAtRef=useRef(0);
   const [currentSeqIdx,setCurrentSeqIdx]=useState(-1),[isPlaying,setIsPlaying]=useState(false),[stimTime,setStimTime]=useState(0),[duration,setDuration]=useState(0),[sampleCount,setSampleCount]=useState(0),[liveAoi,setLiveAoi]=useState(null),[isFullscreen,setIsFullscreen]=useState(false),[showFixation,setShowFixation]=useState(false),[mediaBox,setMediaBox]=useState({left:0,top:0,width:0,height:0});
   const [flowState,setFlowState]=useState('ready'),[surveyBlock,setSurveyBlock]=useState(null),[pendingNextIdx,setPendingNextIdx]=useState(null),[validationResult,setValidationResult]=useState(null),[recalibrating,setRecalibrating]=useState(false);
   const colors=['#F59E0B','#06B6D4','#10B981','#EC4899','#8B5CF6','#EF4444'];
@@ -5155,6 +5155,7 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
   useEffect(()=>{
     if(!window.GazeCloudAPI)return;let throttle=null,pendingAoi=null;
     const onGaze=data=>{
+      lastGazeCallbackAtRef.current=performance.now();
       const qv=quickValidationRef.current;
       if(qv.active){
         const rawX=Number(data?.docX??data?.GazeX??data?.x),rawY=Number(data?.docY??data?.GazeY??data?.y),valid=!!data&&data.state!==-1&&Number.isFinite(rawX)&&Number.isFinite(rawY);
@@ -5170,7 +5171,8 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
       gazeBufferRef.current.push({timestamp:nowMs(),videoTime:stimT*1000,screenX:lx,screenY:ly,xNorm:xN,yNorm:yN,aoi:hitLabel||null,aois:hitNames,trackingState:data.state,rawX:data.GazeX??'',rawY:data.GazeY??''});
       if(!throttle)throttle=setTimeout(()=>{setSampleCount(gazeBufferRef.current.length);setLiveAoi(pendingAoi);throttle=null},250);
     };
-    GazeCloudAPI.OnResult=onGaze;return()=>{if(throttle)clearTimeout(throttle);try{if(window.GazeCloudAPI)window.GazeCloudAPI.OnResult=null}catch(e){}};
+    gazeHandlerRef.current=onGaze;
+    GazeCloudAPI.OnResult=onGaze;return()=>{if(throttle)clearTimeout(throttle);gazeHandlerRef.current=null;try{if(window.GazeCloudAPI&&window.GazeCloudAPI.OnResult===onGaze)window.GazeCloudAPI.OnResult=null}catch(e){}};
   },[]);
 
   const persistCurrent=useCallback(()=>{
@@ -5196,34 +5198,56 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
   const runQuickValidation=useCallback(async(nextIdx,block)=>{
     setPendingNextIdx(nextIdx);setSurveyBlock(block);setFlowState('validation');setValidationResult(null);setIsPlaying(false);isRecordingRef.current=false;
     try{if(document.fullscreenElement)await document.exitFullscreen()}catch(e){}
-    await sleep(500);const qv={active:true,samples:[],nextIdx,block,start:performance.now()};quickValidationRef.current=qv;await sleep(2200);qv.active=false;
-    const analysis=qv.samples.filter(s=>s.t>=600&&s.t<=2050),valid=analysis.filter(s=>s.valid),xs=valid.map(s=>s.x),ys=valid.map(s=>s.y),mx=xs.length?median(xs):null,my=ys.length?median(ys):null,targetX=innerWidth/2,targetY=innerHeight/2,errorPx=Number.isFinite(mx)&&Number.isFinite(my)?Math.hypot(mx-targetX,my-targetY):null,validPct=analysis.length?valid.length/analysis.length*100:0,thresholdPx=Math.max(90,Math.min(160,Math.min(innerWidth,innerHeight)*0.12)),pass=Number.isFinite(errorPx)&&errorPx<=thresholdPx&&validPct>=60&&valid.length>=5;
-    const result={createdAt:new Date().toISOString(),blockId:block?.id||'',blockName:block?.name||'',target:'center',samples:analysis.length,validSamples:valid.length,validPct,errorPx,thresholdPx,pass};window.EyeLabBlockValidationResults=[...(window.EyeLabBlockValidationResults||[]),result];setValidationResult(result);
+    // Quick validation has its own gaze buffer. It does NOT depend on stimulus recording.
+    // Re-bind OnResult in case another phase/library callback replaced it while the survey was open.
+    try{if(window.GazeCloudAPI&&gazeHandlerRef.current)GazeCloudAPI.OnResult=gazeHandlerRef.current;if(window.GazeCloudAPI)GazeCloudAPI.StartEyeTracking?.()}catch(e){}
+    await sleep(650);
+    const qv={active:true,samples:[],nextIdx,block,start:performance.now()};quickValidationRef.current=qv;
+    // Give GazeCloud a little longer to recover after leaving the survey / fullscreen.
+    await sleep(3000);qv.active=false;
+    const analysis=qv.samples.filter(s=>s.t>=700&&s.t<=2850),valid=analysis.filter(s=>s.valid),xs=valid.map(s=>s.x),ys=valid.map(s=>s.y),mx=xs.length?median(xs):null,my=ys.length?median(ys):null,targetX=innerWidth/2,targetY=innerHeight/2,errorPx=Number.isFinite(mx)&&Number.isFinite(my)?Math.hypot(mx-targetX,my-targetY):null,validPct=analysis.length?valid.length/analysis.length*100:0,thresholdPx=Math.max(90,Math.min(160,Math.min(innerWidth,innerHeight)*0.12));
+    const noCallbacks=analysis.length===0,trackingLost=!noCallbacks&&valid.length===0;
+    const pass=!noCallbacks&&!trackingLost&&Number.isFinite(errorPx)&&errorPx<=thresholdPx&&validPct>=60&&valid.length>=5;
+    const reason=noCallbacks?'no_live_gaze':trackingLost?'tracking_lost':pass?'pass':'accuracy_fail';
+    const result={createdAt:new Date().toISOString(),blockId:block?.id||'',blockName:block?.name||'',target:'center',samples:analysis.length,validSamples:valid.length,validPct,errorPx,thresholdPx,pass,reason};window.EyeLabBlockValidationResults=[...(window.EyeLabBlockValidationResults||[]),result];setValidationResult(result);
     if(pass){setTimeout(()=>resumeAt(nextIdx),700)}else setFlowState('validation_fail');
   },[resumeAt]);
 
   const recalibrateAndRetry=useCallback(()=>{
-    if(!window.GazeCloudAPI)return;setRecalibrating(true);setFlowState('recalibrating');
+    if(!window.GazeCloudAPI)return;
+    setRecalibrating(true);setFlowState('recalibrating');
     document.body.classList.add('eyelab-recalibrating');
-    const next=pendingNextIdx,block=surveyBlock;
-    const cleanupRecalibrationUi=()=>{document.body.classList.remove('eyelab-recalibrating')};
+    const next=pendingNextIdx,block=surveyBlock;let poll=null,timeout=null,done=false;
+    const cleanup=()=>{if(poll)clearInterval(poll);if(timeout)clearTimeout(timeout);document.body.classList.remove('eyelab-recalibrating')};
+    const fail=(msg)=>{if(done)return;done=true;cleanup();setRecalibrating(false);setFlowState('validation_fail');if(msg)alert(msg)};
     try{
+      // Hard restart the tracker for recalibration. This is more reliable than calling ShowCalibration()
+      // on a stale between-block tracking session.
       GazeCloudAPI.OnCalibrationComplete=()=>{
-        cleanupRecalibrationUi();
+        if(done)return;done=true;cleanup();
+        try{if(gazeHandlerRef.current)GazeCloudAPI.OnResult=gazeHandlerRef.current}catch(e){}
         setRecalibrating(false);
-        setTimeout(()=>runQuickValidation(next,block),600);
+        setTimeout(()=>runQuickValidation(next,block),1200);
       };
-      GazeCloudAPI.OnCalibrationFail=()=>{
-        cleanupRecalibrationUi();
-        setRecalibrating(false);
-        setFlowState('validation_fail');
-      };
-      // Let React paint the recalibration state first, then force GazeCloud calibration above it.
-      setTimeout(()=>{
-        try{GazeCloudAPI.ShowCalibration()}
-        catch(e){cleanupRecalibrationUi();setRecalibrating(false);setFlowState('validation_fail');alert('Không thể mở calibration: '+(e?.message||String(e)))}
-      },100);
-    }catch(e){cleanupRecalibrationUi();setRecalibrating(false);setFlowState('validation_fail');alert('Không thể mở calibration: '+(e?.message||String(e)))}
+      GazeCloudAPI.OnCalibrationFail=()=>fail('Calibration không thành công. Hãy kiểm tra webcam/ánh sáng rồi thử lại.');
+      try{GazeCloudAPI.RestartEyeTracking()}catch(e){return fail('Không thể khởi động lại eye tracking: '+(e?.message||String(e)))}
+      // Wait until GazeCloud has a live face/tracker and enables its calibration button.
+      poll=setInterval(()=>{
+        try{
+          const btn=document.getElementById('_ButtonCalibrateId');
+          if(btn&&!btn.disabled){
+            clearInterval(poll);poll=null;
+            // Remove the EyeLab overlay before showing GazeCloud calibration so nothing can cover it.
+            setFlowState('recalibration_handoff');
+            setTimeout(()=>{
+              try{GazeCloudAPI.ShowCalibration();setTimeout(()=>{const cal=document.getElementById('CalDivId');if(cal){cal.style.zIndex='60000';cal.style.visibility='visible'}},350)}
+              catch(e){fail('Không thể mở calibration: '+(e?.message||String(e)))}
+            },120);
+          }
+        }catch(e){}
+      },250);
+      timeout=setTimeout(()=>fail('GazeCloud chưa sẵn sàng để calibration. Hãy kiểm tra quyền camera, khuôn mặt và kết nối mạng rồi thử lại.'),20000);
+    }catch(e){fail('Không thể calibration lại: '+(e?.message||String(e)))}
   },[pendingNextIdx,surveyBlock,runQuickValidation]);
 
   const completeSurvey=useCallback(()=>{
@@ -5263,9 +5287,10 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
     <div className="mt-4 flex justify-between items-center gap-3"><div className="font-mono text-[10px] text-[var(--text-3)]">Survey responses không được EyeLab đọc hoặc lưu.</div><button onClick={completeSurvey} className="btn-primary">✓ Tôi đã hoàn tất khảo sát → Tiếp tục</button></div>
   </div>}
 
-  if(['validation','validation_fail','recalibrating'].includes(flowState)){return <div className="fixed inset-0 z-[24000] bg-white text-black flex items-center justify-center"><div className="text-center max-w-xl px-6">
+  if(flowState==='recalibration_handoff'){return <div className="fixed inset-0 z-[50] bg-white"></div>}
+  if(['validation','validation_fail','recalibrating'].includes(flowState)){return <div className={`fixed inset-0 ${flowState==='recalibrating'?'z-[50]':'z-[24000]'} bg-white text-black flex items-center justify-center`}><div className="text-center max-w-xl px-6">
     <div className="font-mono text-xs text-black/50 uppercase tracking-widest mb-5">EyeLab · Between-block quality check</div>
-    {flowState==='validation'?<><div className="w-14 h-14 rounded-full border-4 border-red-500 bg-red-500/10 mx-auto mb-6"></div><h2 className="text-3xl font-semibold mb-3">Nhìn vào chấm đỏ ở giữa màn hình</h2><p className="text-black/60">Giữ đầu ổn định. EyeLab đang kiểm tra nhanh calibration trước Block tiếp theo.</p></>:flowState==='recalibrating'?<><h2 className="text-3xl font-semibold mb-3">Đang calibration lại…</h2><p className="text-black/60">Màn hình calibration của GazeCloud sẽ hiện ngay phía trên. Hoàn tất calibration, sau đó EyeLab sẽ tự kiểm tra lại.</p></>:<><h2 className="text-3xl font-semibold mb-3">Quick validation chưa đạt</h2><p className="text-black/60 mb-3">Median error: <b>{fmt(validationResult?.errorPx,0)} px</b> · ngưỡng: {fmt(validationResult?.thresholdPx,0)} px · valid gaze: {fmt(validationResult?.validPct,0)}%</p><p className="text-black/60 mb-6">Có thể do participant đổi tư thế, laptop/webcam di chuyển hoặc ánh sáng thay đổi.</p><div className="flex gap-3 justify-center"><button onClick={()=>runQuickValidation(pendingNextIdx,surveyBlock)} className="btn-ghost">↻ Kiểm tra lại</button><button onClick={recalibrateAndRetry} className="btn-primary">◎ Calibration lại</button></div></>}
+    {flowState==='validation'?<><div className="w-14 h-14 rounded-full border-4 border-red-500 bg-red-500/10 mx-auto mb-6"></div><h2 className="text-3xl font-semibold mb-3">Nhìn vào chấm đỏ ở giữa màn hình</h2><p className="text-black/60">EyeLab đang thu gaze bằng bộ đệm validation riêng (không ghi vào dữ liệu stimulus). Giữ đầu ổn định trong vài giây.</p></>:flowState==='recalibrating'?<><h2 className="text-3xl font-semibold mb-3">Đang khởi động lại eye tracking…</h2><p className="text-black/60">EyeLab đang mở lại camera/GazeCloud. Khi tracker nhận diện khuôn mặt, calibration sẽ tự xuất hiện.</p></>:<><h2 className="text-3xl font-semibold mb-3">{validationResult?.reason==='no_live_gaze'?'Không nhận được gaze từ GazeCloud':validationResult?.reason==='tracking_lost'?'GazeCloud đang mất tracking':'Quick validation chưa đạt'}</h2>{validationResult?.reason==='no_live_gaze'?<p className="text-black/60 mb-6">Không có callback gaze trong thời gian kiểm tra. Đây là lỗi trạng thái tracking, không phải kết luận calibration kém. Hãy thử kiểm tra lại; nếu vẫn vậy, calibration lại sẽ restart hẳn GazeCloud.</p>:validationResult?.reason==='tracking_lost'?<p className="text-black/60 mb-6">Có callback từ GazeCloud nhưng toàn bộ ở trạng thái mất tracking. Hãy kiểm tra khuôn mặt, ánh sáng và webcam.</p>:<><p className="text-black/60 mb-3">Median error: <b>{fmt(validationResult?.errorPx,0)} px</b> · ngưỡng: {fmt(validationResult?.thresholdPx,0)} px · valid gaze: {fmt(validationResult?.validPct,0)}%</p><p className="text-black/60 mb-6">Calibration hiện tại chưa đủ chính xác cho Block tiếp theo.</p></>}<div className="flex gap-3 justify-center"><button onClick={()=>runQuickValidation(pendingNextIdx,surveyBlock)} className="btn-ghost">↻ Kiểm tra lại</button><button onClick={recalibrateAndRetry} className="btn-primary">◎ Restart & Calibration lại</button></div></>}
   </div></div>}
 
   return(<div>
