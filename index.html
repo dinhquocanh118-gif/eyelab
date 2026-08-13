@@ -3484,6 +3484,18 @@ body.eyelab-calibrating .home-floating{
   visibility:hidden !important;
   pointer-events:none !important;
 }
+
+/* Between-block recalibration: GazeCloud calibration UI must sit above EyeLab quality-check overlay. */
+body.eyelab-recalibrating #CalDivId,
+body.eyelab-recalibrating #infoWaitForCalibration,
+body.eyelab-recalibrating #initializingid,
+body.eyelab-recalibrating #loadid,
+body.eyelab-recalibrating #errid,
+body.eyelab-recalibrating #CamAccessid,
+body.eyelab-recalibrating #GazeFlowContainer,
+body.eyelab-recalibrating #camid{
+  z-index:30050 !important;
+}
 </style>
 </head>
 <body>
@@ -5192,12 +5204,26 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
 
   const recalibrateAndRetry=useCallback(()=>{
     if(!window.GazeCloudAPI)return;setRecalibrating(true);setFlowState('recalibrating');
+    document.body.classList.add('eyelab-recalibrating');
     const next=pendingNextIdx,block=surveyBlock;
+    const cleanupRecalibrationUi=()=>{document.body.classList.remove('eyelab-recalibrating')};
     try{
-      GazeCloudAPI.OnCalibrationComplete=()=>{setRecalibrating(false);setTimeout(()=>runQuickValidation(next,block),600)};
-      GazeCloudAPI.OnCalibrationFail=()=>{setRecalibrating(false);setFlowState('validation_fail')};
-      GazeCloudAPI.ShowCalibration();
-    }catch(e){setRecalibrating(false);setFlowState('validation_fail');alert('Không thể mở calibration: '+(e?.message||String(e)))}
+      GazeCloudAPI.OnCalibrationComplete=()=>{
+        cleanupRecalibrationUi();
+        setRecalibrating(false);
+        setTimeout(()=>runQuickValidation(next,block),600);
+      };
+      GazeCloudAPI.OnCalibrationFail=()=>{
+        cleanupRecalibrationUi();
+        setRecalibrating(false);
+        setFlowState('validation_fail');
+      };
+      // Let React paint the recalibration state first, then force GazeCloud calibration above it.
+      setTimeout(()=>{
+        try{GazeCloudAPI.ShowCalibration()}
+        catch(e){cleanupRecalibrationUi();setRecalibrating(false);setFlowState('validation_fail');alert('Không thể mở calibration: '+(e?.message||String(e)))}
+      },100);
+    }catch(e){cleanupRecalibrationUi();setRecalibrating(false);setFlowState('validation_fail');alert('Không thể mở calibration: '+(e?.message||String(e)))}
   },[pendingNextIdx,surveyBlock,runQuickValidation]);
 
   const completeSurvey=useCallback(()=>{
@@ -5239,7 +5265,7 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
 
   if(['validation','validation_fail','recalibrating'].includes(flowState)){return <div className="fixed inset-0 z-[24000] bg-white text-black flex items-center justify-center"><div className="text-center max-w-xl px-6">
     <div className="font-mono text-xs text-black/50 uppercase tracking-widest mb-5">EyeLab · Between-block quality check</div>
-    {flowState==='validation'?<><div className="w-14 h-14 rounded-full border-4 border-red-500 bg-red-500/10 mx-auto mb-6"></div><h2 className="text-3xl font-semibold mb-3">Nhìn vào chấm đỏ ở giữa màn hình</h2><p className="text-black/60">Giữ đầu ổn định. EyeLab đang kiểm tra nhanh calibration trước Block tiếp theo.</p></>:flowState==='recalibrating'?<><h2 className="text-3xl font-semibold mb-3">Đang calibration lại…</h2><p className="text-black/60">Hoàn tất calibration của GazeCloud, sau đó EyeLab sẽ tự kiểm tra lại.</p></>:<><h2 className="text-3xl font-semibold mb-3">Quick validation chưa đạt</h2><p className="text-black/60 mb-3">Median error: <b>{fmt(validationResult?.errorPx,0)} px</b> · ngưỡng: {fmt(validationResult?.thresholdPx,0)} px · valid gaze: {fmt(validationResult?.validPct,0)}%</p><p className="text-black/60 mb-6">Có thể do participant đổi tư thế, laptop/webcam di chuyển hoặc ánh sáng thay đổi.</p><div className="flex gap-3 justify-center"><button onClick={()=>runQuickValidation(pendingNextIdx,surveyBlock)} className="btn-ghost">↻ Kiểm tra lại</button><button onClick={recalibrateAndRetry} className="btn-primary">◎ Calibration lại</button></div></>}
+    {flowState==='validation'?<><div className="w-14 h-14 rounded-full border-4 border-red-500 bg-red-500/10 mx-auto mb-6"></div><h2 className="text-3xl font-semibold mb-3">Nhìn vào chấm đỏ ở giữa màn hình</h2><p className="text-black/60">Giữ đầu ổn định. EyeLab đang kiểm tra nhanh calibration trước Block tiếp theo.</p></>:flowState==='recalibrating'?<><h2 className="text-3xl font-semibold mb-3">Đang calibration lại…</h2><p className="text-black/60">Màn hình calibration của GazeCloud sẽ hiện ngay phía trên. Hoàn tất calibration, sau đó EyeLab sẽ tự kiểm tra lại.</p></>:<><h2 className="text-3xl font-semibold mb-3">Quick validation chưa đạt</h2><p className="text-black/60 mb-3">Median error: <b>{fmt(validationResult?.errorPx,0)} px</b> · ngưỡng: {fmt(validationResult?.thresholdPx,0)} px · valid gaze: {fmt(validationResult?.validPct,0)}%</p><p className="text-black/60 mb-6">Có thể do participant đổi tư thế, laptop/webcam di chuyển hoặc ánh sáng thay đổi.</p><div className="flex gap-3 justify-center"><button onClick={()=>runQuickValidation(pendingNextIdx,surveyBlock)} className="btn-ghost">↻ Kiểm tra lại</button><button onClick={recalibrateAndRetry} className="btn-primary">◎ Calibration lại</button></div></>}
   </div></div>}
 
   return(<div>
