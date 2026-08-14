@@ -3485,17 +3485,16 @@ body.eyelab-calibrating .home-floating{
   pointer-events:none !important;
 }
 
-/* Between-block recalibration: GazeCloud calibration UI must sit above EyeLab quality-check overlay. */
-body.eyelab-recalibrating #CalDivId,
-body.eyelab-recalibrating #infoWaitForCalibration,
+/* Between-block recalibration: preserve GazeCloud's internal layer ordering.
+   IMPORTANT: GazeFlowContainer must stay BELOW the camera panel and calibration canvas. */
+body.eyelab-recalibrating #GazeFlowContainer{z-index:30000 !important;display:block !important;}
+body.eyelab-recalibrating #camid{z-index:30020 !important;}
+body.eyelab-recalibrating #CalDivId{z-index:30100 !important;}
+body.eyelab-recalibrating #infoWaitForCalibration{z-index:30120 !important;}
 body.eyelab-recalibrating #initializingid,
 body.eyelab-recalibrating #loadid,
-body.eyelab-recalibrating #errid,
-body.eyelab-recalibrating #CamAccessid,
-body.eyelab-recalibrating #GazeFlowContainer,
-body.eyelab-recalibrating #camid{
-  z-index:30050 !important;
-}
+body.eyelab-recalibrating #CamAccessid{z-index:30200 !important;}
+body.eyelab-recalibrating #errid{z-index:30300 !important;}
 </style>
 </head>
 <body>
@@ -5215,38 +5214,62 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
 
   const recalibrateAndRetry=useCallback(()=>{
     if(!window.GazeCloudAPI)return;
-    setRecalibrating(true);setFlowState('recalibrating');
+    const next=pendingNextIdx,block=surveyBlock;
+    setRecalibrating(true);
+    setFlowState('recalibration_handoff');
     document.body.classList.add('eyelab-recalibrating');
-    const next=pendingNextIdx,block=surveyBlock;let poll=null,timeout=null,done=false;
-    const cleanup=()=>{if(poll)clearInterval(poll);if(timeout)clearTimeout(timeout);document.body.classList.remove('eyelab-recalibrating')};
-    const fail=(msg)=>{if(done)return;done=true;cleanup();setRecalibrating(false);setFlowState('validation_fail');if(msg)alert(msg)};
+    let finished=false;
+
+    const cleanup=()=>{
+      document.body.classList.remove('eyelab-recalibrating');
+      try{
+        const gfc=document.getElementById('GazeFlowContainer');
+        if(gfc)gfc.style.display='none';
+        const cam=document.getElementById('camid');
+        if(cam)cam.style.display='none';
+      }catch(e){}
+    };
+    const fail=(msg)=>{
+      if(finished)return;
+      finished=true;
+      cleanup();
+      setRecalibrating(false);
+      setFlowState('validation_fail');
+      if(msg)alert(msg);
+    };
+
     try{
-      // Hard restart the tracker for recalibration. This is more reliable than calling ShowCalibration()
-      // on a stale between-block tracking session.
+      // Recalibration is started as a fresh GazeCloud session. We intentionally DO NOT
+      // auto-click the internal calibration button. The participant sees the same
+      // face-position screen as the initial calibration and clicks Start Gaze Calibration
+      // once GazeCloud has detected a stable face. This avoids stale/disabled-button races.
       GazeCloudAPI.OnCalibrationComplete=()=>{
-        if(done)return;done=true;cleanup();
+        if(finished)return;
+        finished=true;
+        cleanup();
         try{if(gazeHandlerRef.current)GazeCloudAPI.OnResult=gazeHandlerRef.current}catch(e){}
         setRecalibrating(false);
         setTimeout(()=>runQuickValidation(next,block),1200);
       };
-      GazeCloudAPI.OnCalibrationFail=()=>fail('Calibration không thành công. Hãy kiểm tra webcam/ánh sáng rồi thử lại.');
-      try{GazeCloudAPI.RestartEyeTracking()}catch(e){return fail('Không thể khởi động lại eye tracking: '+(e?.message||String(e)))}
-      // Wait until GazeCloud has a live face/tracker and enables its calibration button.
-      poll=setInterval(()=>{
+      GazeCloudAPI.OnCalibrationFail=()=>fail('Calibration không thành công. Hãy kiểm tra webcam, ánh sáng và vị trí khuôn mặt rồi thử lại.');
+      GazeCloudAPI.OnCamDenied=()=>fail('Không truy cập được camera. Hãy cấp quyền camera cho trang EyeLab rồi thử lại.');
+
+      try{GazeCloudAPI.StopEyeTracking?.()}catch(e){}
+      setTimeout(()=>{
+        if(finished)return;
         try{
-          const btn=document.getElementById('_ButtonCalibrateId');
-          if(btn&&!btn.disabled){
-            clearInterval(poll);poll=null;
-            // Remove the EyeLab overlay before showing GazeCloud calibration so nothing can cover it.
-            setFlowState('recalibration_handoff');
-            setTimeout(()=>{
-              try{GazeCloudAPI.ShowCalibration();setTimeout(()=>{const cal=document.getElementById('CalDivId');if(cal){cal.style.zIndex='60000';cal.style.visibility='visible'}},350)}
-              catch(e){fail('Không thể mở calibration: '+(e?.message||String(e)))}
-            },120);
-          }
-        }catch(e){}
-      },250);
-      timeout=setTimeout(()=>fail('GazeCloud chưa sẵn sàng để calibration. Hãy kiểm tra quyền camera, khuôn mặt và kết nối mạng rồi thử lại.'),20000);
+          if(gazeHandlerRef.current)GazeCloudAPI.OnResult=gazeHandlerRef.current;
+          GazeCloudAPI.StartEyeTracking?.();
+          // Let GazeCloud own the screen. Its camera/face-position UI will become visible
+          // when initialization finishes; the calibration button enables only when ready.
+          setTimeout(()=>{
+            try{
+              const gfc=document.getElementById('GazeFlowContainer');if(gfc)gfc.style.display='block';
+              const cam=document.getElementById('camid');if(cam){cam.style.zIndex='30020';}
+            }catch(e){}
+          },500);
+        }catch(e){fail('Không thể khởi động lại eye tracking: '+(e?.message||String(e)))}
+      },700);
     }catch(e){fail('Không thể calibration lại: '+(e?.message||String(e)))}
   },[pendingNextIdx,surveyBlock,runQuickValidation]);
 
@@ -5287,10 +5310,10 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
     <div className="mt-4 flex justify-between items-center gap-3"><div className="font-mono text-[10px] text-[var(--text-3)]">Survey responses không được EyeLab đọc hoặc lưu.</div><button onClick={completeSurvey} className="btn-primary">✓ Tôi đã hoàn tất khảo sát → Tiếp tục</button></div>
   </div>}
 
-  if(flowState==='recalibration_handoff'){return <div className="fixed inset-0 z-[50] bg-white"></div>}
+  if(flowState==='recalibration_handoff'){return <div className="fixed inset-0 z-[50] bg-white text-black flex items-end justify-center pb-8"><div className="font-mono text-xs text-black/40">GazeCloud đang khởi động lại — giữ khuôn mặt trong khung camera và bấm Start Gaze Calibration khi nút sáng lên.</div></div>}
   if(['validation','validation_fail','recalibrating'].includes(flowState)){return <div className={`fixed inset-0 ${flowState==='recalibrating'?'z-[50]':'z-[24000]'} bg-white text-black flex items-center justify-center`}><div className="text-center max-w-xl px-6">
     <div className="font-mono text-xs text-black/50 uppercase tracking-widest mb-5">EyeLab · Between-block quality check</div>
-    {flowState==='validation'?<><div className="w-14 h-14 rounded-full border-4 border-red-500 bg-red-500/10 mx-auto mb-6"></div><h2 className="text-3xl font-semibold mb-3">Nhìn vào chấm đỏ ở giữa màn hình</h2><p className="text-black/60">EyeLab đang thu gaze bằng bộ đệm validation riêng (không ghi vào dữ liệu stimulus). Giữ đầu ổn định trong vài giây.</p></>:flowState==='recalibrating'?<><h2 className="text-3xl font-semibold mb-3">Đang khởi động lại eye tracking…</h2><p className="text-black/60">EyeLab đang mở lại camera/GazeCloud. Khi tracker nhận diện khuôn mặt, calibration sẽ tự xuất hiện.</p></>:<><h2 className="text-3xl font-semibold mb-3">{validationResult?.reason==='no_live_gaze'?'Không nhận được gaze từ GazeCloud':validationResult?.reason==='tracking_lost'?'GazeCloud đang mất tracking':'Quick validation chưa đạt'}</h2>{validationResult?.reason==='no_live_gaze'?<p className="text-black/60 mb-6">Không có callback gaze trong thời gian kiểm tra. Đây là lỗi trạng thái tracking, không phải kết luận calibration kém. Hãy thử kiểm tra lại; nếu vẫn vậy, calibration lại sẽ restart hẳn GazeCloud.</p>:validationResult?.reason==='tracking_lost'?<p className="text-black/60 mb-6">Có callback từ GazeCloud nhưng toàn bộ ở trạng thái mất tracking. Hãy kiểm tra khuôn mặt, ánh sáng và webcam.</p>:<><p className="text-black/60 mb-3">Median error: <b>{fmt(validationResult?.errorPx,0)} px</b> · ngưỡng: {fmt(validationResult?.thresholdPx,0)} px · valid gaze: {fmt(validationResult?.validPct,0)}%</p><p className="text-black/60 mb-6">Calibration hiện tại chưa đủ chính xác cho Block tiếp theo.</p></>}<div className="flex gap-3 justify-center"><button onClick={()=>runQuickValidation(pendingNextIdx,surveyBlock)} className="btn-ghost">↻ Kiểm tra lại</button><button onClick={recalibrateAndRetry} className="btn-primary">◎ Restart & Calibration lại</button></div></>}
+    {flowState==='validation'?<><div className="w-[84px] h-[84px] rounded-full border-[6px] border-red-500 bg-red-500/10 mx-auto mb-6"></div><h2 className="text-3xl font-semibold mb-3">Nhìn vào chấm đỏ ở giữa màn hình</h2><p className="text-black/60">EyeLab đang thu gaze bằng bộ đệm validation riêng (không ghi vào dữ liệu stimulus). Giữ đầu ổn định trong vài giây.</p></>:flowState==='recalibrating'?<><h2 className="text-3xl font-semibold mb-3">Đang khởi động lại eye tracking…</h2><p className="text-black/60">EyeLab đang mở lại camera/GazeCloud. Khi tracker nhận diện khuôn mặt, calibration sẽ tự xuất hiện.</p></>:<><h2 className="text-3xl font-semibold mb-3">{validationResult?.reason==='no_live_gaze'?'Không nhận được gaze từ GazeCloud':validationResult?.reason==='tracking_lost'?'GazeCloud đang mất tracking':'Quick validation chưa đạt'}</h2>{validationResult?.reason==='no_live_gaze'?<p className="text-black/60 mb-6">Không có callback gaze trong thời gian kiểm tra. Đây là lỗi trạng thái tracking, không phải kết luận calibration kém. Hãy thử kiểm tra lại; nếu vẫn vậy, calibration lại sẽ restart hẳn GazeCloud.</p>:validationResult?.reason==='tracking_lost'?<p className="text-black/60 mb-6">Có callback từ GazeCloud nhưng toàn bộ ở trạng thái mất tracking. Hãy kiểm tra khuôn mặt, ánh sáng và webcam.</p>:<><p className="text-black/60 mb-3">Median error: <b>{fmt(validationResult?.errorPx,0)} px</b> · ngưỡng: {fmt(validationResult?.thresholdPx,0)} px · valid gaze: {fmt(validationResult?.validPct,0)}%</p><p className="text-black/60 mb-6">Calibration hiện tại chưa đủ chính xác cho Block tiếp theo.</p></>}<div className="flex gap-3 justify-center"><button onClick={()=>runQuickValidation(pendingNextIdx,surveyBlock)} className="btn-ghost">↻ Kiểm tra lại</button><button onClick={recalibrateAndRetry} className="btn-primary">◎ Restart & Calibration lại</button></div></>}
   </div></div>}
 
   return(<div>
