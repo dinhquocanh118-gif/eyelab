@@ -3511,7 +3511,7 @@ const nowMs=()=>performance.now();
 const fmt=(n,d=2)=>(n==null||isNaN(n))?'—':Number(n).toFixed(d);
 const fmtMs=(ms)=>{if(ms==null||isNaN(ms))return '—';if(ms<1000)return Math.round(ms)+'ms';return (ms/1000).toFixed(2)+'s'};
 const fmtTime=(s)=>{if(s==null||isNaN(s))return '0:00';const m=Math.floor(s/60),r=Math.floor(s%60);return m+':'+String(r).padStart(2,'0')};
-const generateSessionId=()=>{const d=new Date(),pad=n=>String(n).padStart(2,'0');return `S${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`};
+const generateSessionId=()=>{const d=new Date(),pad=(n,w=2)=>String(n).padStart(w,'0'),rnd=globalThis.crypto?.randomUUID?.().slice(0,8)||Math.random().toString(16).slice(2,10);return `S${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}${pad(d.getMilliseconds(),3)}-${rnd}`};
 const median=arr=>{if(!arr.length)return 0;const s=[...arr].sort((a,b)=>a-b),m=Math.floor(s.length/2);return s.length%2?s[m]:(s[m-1]+s[m])/2};
 const stddev=arr=>{if(!arr.length)return 0;const m=arr.reduce((s,v)=>s+v,0)/arr.length;return Math.sqrt(arr.reduce((s,v)=>s+(v-m)**2,0)/arr.length)};
 const slug=s=>(s||'').replace(/[^a-zA-Z0-9_-]+/g,'_').replace(/^_+|_+$/g,'').slice(0,40)||'stim';
@@ -3539,9 +3539,9 @@ function normalizeBlocks(blocks,stimuli=[]){
   let out=(Array.isArray(blocks)?blocks:[]).map((b,i)=>({
     id:b.id||newBlockId(),name:(b.name||`Block ${i+1}`).trim()||`Block ${i+1}`,order:i+1,
     surveyUrl:b.surveyUrl||'',surveyTitle:b.surveyTitle||`Survey ${i+1}`,
-    surveyAutoDetect:b.surveyAutoDetect!==false,quickValidation:b.quickValidation!==false
+    surveyAutoDetect:b.surveyAutoDetect===true,quickValidation:b.quickValidation!==false
   }));
-  if(!out.length)out=[{id:newBlockId(),name:DEFAULT_BLOCK_NAME,order:1,surveyUrl:'',surveyTitle:'Survey 1',surveyAutoDetect:true,quickValidation:true}];
+  if(!out.length)out=[{id:newBlockId(),name:DEFAULT_BLOCK_NAME,order:1,surveyUrl:'',surveyTitle:'Survey 1',surveyAutoDetect:false,quickValidation:true}];
   const ids=new Set(out.map(b=>b.id));
   const fallback=out[0].id;
   stimuli.forEach(st=>{if(!st.blockId||!ids.has(st.blockId))st.blockId=fallback});
@@ -3579,12 +3579,16 @@ async function publishProjectRemote(stimuli,blocks,projectInfo){
   const {data:userData,error:userErr}=await sb.auth.getUser();if(userErr||!userData?.user)throw new Error('Hãy đăng nhập Remote Admin trước khi publish.');
   if(!projectInfo?.id)throw new Error('Hãy lưu project local trước khi publish.');
   const publicSlug=buildPublicSlug(projectInfo);const remoteStimuli=[];
+  // Create/claim the project row before uploading. Storage RLS uses the first path
+  // segment (project id) to verify ownership, so new projects must exist first.
+  const draftRow={id:String(projectInfo.id),public_slug:publicSlug,name:projectInfo.name||DEFAULT_PROJECT_NAME,is_published:false,config_json:{version:3,id:projectInfo.id,name:projectInfo.name||DEFAULT_PROJECT_NAME,blocks:normalizeBlocks(blocks,stimuli),stimuli:[]},updated_at:new Date().toISOString()};
+  const {error:draftErr}=await sb.from(REMOTE_CONFIG.projectTable||'eyelab_projects').upsert(draftRow,{onConflict:'id'});if(draftErr)throw draftErr;
   for(const st of stimuli){
     const clean=serializeStimuliForStorage([{...st}])[0];let remoteUrl=st.remoteUrl||'';
     if(String(st.dataUrl||st.url||'').startsWith('data:')){
       const blob=dataUrlToBlob(st.dataUrl||st.url);const ext=(st.fileName?.split('.').pop()|| (st.type==='video'?'mp4':'png')).replace(/[^a-zA-Z0-9]/g,'').toLowerCase();
       const path=`${projectInfo.id}/${st.id}-${slug(st.fileName||st.name)}.${ext}`;
-      const {error:upErr}=await sb.storage.from(REMOTE_CONFIG.storageBucket||'eyelab-stimuli').upload(path,blob,{contentType:blob.type||undefined,upsert:true,cacheControl:'3600'});if(upErr)throw upErr;
+      const {error:upErr}=await sb.storage.from(REMOTE_CONFIG.storageBucket||'eyelab-stimuli').upload(path,blob,{contentType:blob.type||undefined,upsert:true,cacheControl:'60'});if(upErr)throw upErr;
       const {data:pub}=sb.storage.from(REMOTE_CONFIG.storageBucket||'eyelab-stimuli').getPublicUrl(path);remoteUrl=pub?.publicUrl||'';
     }else remoteUrl=st.remoteUrl||st.dataUrl||st.url;
     if(!remoteUrl)throw new Error(`Không tạo được public URL cho stimulus ${st.name}.`);
@@ -3596,7 +3600,24 @@ async function publishProjectRemote(stimuli,blocks,projectInfo){
   const {error}=await sb.from(REMOTE_CONFIG.projectTable||'eyelab_projects').upsert(row,{onConflict:'id'});if(error)throw error;
   return{publicSlug,config,row};
 }
-async function unpublishProjectRemote(projectInfo){const sb=getSupabaseClient();if(!sb)throw new Error('Supabase chưa được cấu hình.');const {error}=await sb.from(REMOTE_CONFIG.projectTable||'eyelab_projects').update({is_published:false,updated_at:new Date().toISOString()}).eq('id',String(projectInfo.id));if(error)throw error;return true}
+async function removeRemoteProjectStimuli(projectId){
+  const sb=getSupabaseClient();if(!sb||!projectId)return 0;
+  const bucket=REMOTE_CONFIG.storageBucket||'eyelab-stimuli',paths=[];let offset=0;
+  while(true){
+    const {data,error}=await sb.storage.from(bucket).list(String(projectId),{limit:100,offset,sortBy:{column:'name',order:'asc'}});
+    if(error)throw error;
+    const rows=(data||[]).filter(x=>x?.name&&x.id);paths.push(...rows.map(x=>`${projectId}/${x.name}`));
+    if((data||[]).length<100)break;offset+=100;
+  }
+  for(let i=0;i<paths.length;i+=100){const {error}=await sb.storage.from(bucket).remove(paths.slice(i,i+100));if(error)throw error}
+  return paths.length;
+}
+async function unpublishProjectRemote(projectInfo){
+  const sb=getSupabaseClient();if(!sb)throw new Error('Supabase chưa được cấu hình.');
+  const {error}=await sb.from(REMOTE_CONFIG.projectTable||'eyelab_projects').update({is_published:false,updated_at:new Date().toISOString()}).eq('id',String(projectInfo.id));if(error)throw error;
+  const removed=await removeRemoteProjectStimuli(projectInfo.id);
+  return{removed};
+}
 async function loadRemoteProjectBySlug(publicSlug){
   const sb=getSupabaseClient();if(!sb)throw new Error('Supabase chưa được cấu hình trong file HTML được deploy.');
   const {data,error}=await sb.from(REMOTE_CONFIG.projectTable||'eyelab_projects').select('id,public_slug,name,config_json,is_published,updated_at').eq('public_slug',publicSlug).eq('is_published',true).maybeSingle();
@@ -3606,7 +3627,9 @@ async function loadRemoteProjectBySlug(publicSlug){
 async function saveRemoteTestSessionRecord(record,publicSlug=''){
   const sb=getSupabaseClient();if(!sb)throw new Error('Supabase chưa được cấu hình.');
   const payload={session_id:record.sessionId,project_id:String(record.projectId||''),public_slug:publicSlug||null,participant_id:record.participantId||null,participant_name:record.participantName||null,created_at:record.createdAt||new Date().toISOString(),device_info:record.deviceInfo||{},quality_json:record.quality||{},session_payload:record};
-  const {error}=await sb.from(REMOTE_CONFIG.sessionTable||'eyelab_eye_tracking_sessions').insert(payload);if(error)throw error;return true;
+  const {error}=await sb.from(REMOTE_CONFIG.sessionTable||'eyelab_eye_tracking_sessions').insert(payload);
+  if(error&&error.code!=='23505')throw error;
+  return true;
 }
 async function loadRemoteTestSessions(projectId=null){
   const sb=getSupabaseClient();if(!sb)throw new Error('Supabase chưa được cấu hình.');
@@ -3704,7 +3727,7 @@ function normalizeImportedProject(raw,sourceFileName=''){
     const inferredType=s.type||(String(dataUrl).startsWith('data:video')?'video':'image');
     if(!['image','video'].includes(inferredType))throw new Error(`Stimulus #${i+1} có type không hợp lệ.`);
     return{
-      id:Date.now()+i,
+      id:s.id??(Date.now()+i),
       type:inferredType,
       name:(s.name||s.fileName||`Stimulus ${i+1}`).replace(/\.[^.]+$/,''),
       industry:s.industry||'',
@@ -3712,6 +3735,7 @@ function normalizeImportedProject(raw,sourceFileName=''){
       size:Number(s.size)||0,
       displayDurationSec:Math.max(1,Math.min(120,Number(s.displayDurationSec)||DEFAULT_IMAGE_DURATION_SEC)),
       order:i+1,
+      blockId:s.blockId||null,
       aois:(s.aois||[]).map((a,j)=>({
         id:a.id||('AOI-'+(j+1)+'-'+Date.now()),
         name:a.name||`AOI ${j+1}`,
@@ -3724,6 +3748,7 @@ function normalizeImportedProject(raw,sourceFileName=''){
         color:a.color
       })),
       dataUrl,
+      remoteUrl:s.remoteUrl||'',
       url:dataUrl,
       gazeData:[],
       durationMs:0
@@ -4415,7 +4440,7 @@ function WelcomePhase({onNext,demographics,setDemographics}){
     }catch(e){setError('Không truy cập được webcam. Kiểm tra quyền trình duyệt.');setCameraReady(false)}finally{setRequesting(false)}
   };
   const update=(k,v)=>setDemographics(d=>({...d,[k]:v}));
-  const isValid=demographics.name.trim().length>0&&Number(demographics.age)>0&&Number(demographics.age)<120&&demographics.gender&&demographics.education&&demographics.consent&&cameraReady&&!!preflight?.criticalPass;
+  const isValid=demographics.participantId.trim().length>0&&demographics.name.trim().length>0&&Number(demographics.age)>0&&Number(demographics.age)<120&&demographics.gender&&demographics.education&&demographics.consent&&cameraReady&&!!preflight?.criticalPass;
   return(
     <div className="grid grid-cols-12 gap-6">
       <div className="col-span-12 lg:col-span-7">
@@ -4424,7 +4449,7 @@ function WelcomePhase({onNext,demographics,setDemographics}){
         <p className="text-[var(--text-2)] leading-relaxed max-w-xl mb-6">Vui lòng điền đầy đủ thông tin.</p>
         {isFile&&(<div className="panel p-4 mb-6" style={{borderColor:'var(--danger)',background:'rgba(239,68,68,0.05)'}}><div className="text-sm mb-1">⚠ Đang chạy từ file:// — eye-tracking sẽ không hoạt động</div><div className="text-xs text-[var(--text-2)] font-mono">Cần HTTP server: <span className="text-[var(--accent)]">python -m http.server 8000</span></div></div>)}
         <div className="panel p-6 space-y-5">
-          <div><label className="font-mono text-[10px] text-[var(--text-2)] uppercase tracking-widest block mb-2">Mã người tham gia</label><input className="input-base" value={demographics.participantId} onChange={e=>update('participantId',e.target.value)} /></div>
+          <div><label className="font-mono text-[10px] text-[var(--text-2)] uppercase tracking-widest block mb-2">Mã người tham gia <span className="text-[var(--danger)]">*</span></label><input className="input-base" value={demographics.participantId} onChange={e=>update('participantId',e.target.value)} placeholder="VD: P001 hoặc mã từ survey" /></div>
           <div className="grid grid-cols-2 gap-4">
             <div><label className="font-mono text-[10px] text-[var(--text-2)] uppercase tracking-widest block mb-2">Tên đầy đủ <span className="text-[var(--danger)]">*</span></label><input className="input-base" value={demographics.name} onChange={e=>update('name',e.target.value)} placeholder="Nguyễn Văn A" /></div>
             <div><label className="font-mono text-[10px] text-[var(--text-2)] uppercase tracking-widest block mb-2">Tuổi <span className="text-[var(--danger)]">*</span></label><input type="number" min="1" max="120" className="input-base" value={demographics.age} onChange={e=>update('age',e.target.value)} placeholder="22" /></div>
@@ -4511,7 +4536,7 @@ function UploadPhase({onNext,stimuli,setStimuli,blocks,setBlocks,projectInfo,onP
   const move=(id,dir)=>setStimuli(prev=>{const idx=prev.findIndex(s=>s.id===id);if(idx<0)return prev;const current=prev[idx];const peers=prev.map((s,i)=>({s,i})).filter(x=>x.s.blockId===current.blockId);const peerPos=peers.findIndex(x=>x.i===idx);const targetPeer=peers[peerPos+dir];if(!targetPeer)return prev;const next=[...prev];[next[idx],next[targetPeer.i]]=[next[targetPeer.i],next[idx]];return next.map((s,i)=>({...s,order:i+1}))});
   const patchStim=(id,patch)=>setStimuli(prev=>prev.map(s=>s.id===id?{...s,...patch}:s));
 
-  const addBlock=()=>setBlocks(prev=>normalizeBlocks([...(prev||[]),{id:newBlockId(),name:`Block ${(prev||[]).length+1}`,surveyTitle:`Survey ${(prev||[]).length+1}`,surveyUrl:'',surveyAutoDetect:true,quickValidation:true}],stimuli));
+  const addBlock=()=>setBlocks(prev=>normalizeBlocks([...(prev||[]),{id:newBlockId(),name:`Block ${(prev||[]).length+1}`,surveyTitle:`Survey ${(prev||[]).length+1}`,surveyUrl:'',surveyAutoDetect:false,quickValidation:true}],stimuli));
   const patchBlock=(id,patch)=>setBlocks(prev=>normalizeBlocks((prev||[]).map(b=>b.id===id?{...b,...patch}:b),stimuli));
   const moveBlock=(id,dir)=>setBlocks(prev=>{const arr=[...normalizeBlocks(prev,stimuli)];const i=arr.findIndex(b=>b.id===id),j=i+dir;if(i<0||j<0||j>=arr.length)return arr;[arr[i],arr[j]]=[arr[j],arr[i]];return arr.map((b,k)=>({...b,order:k+1}))});
   const removeBlock=id=>{
@@ -4526,7 +4551,7 @@ function UploadPhase({onNext,stimuli,setStimuli,blocks,setBlocks,projectInfo,onP
   return(<div>
     <div className="font-mono text-[10px] text-[var(--accent)] uppercase tracking-[0.3em] mb-4">PHASE 02 / PROJECT FLOW · BLOCKS + STIMULI</div>
     <h2 className="font-display text-4xl mb-2">Thiết lập <span className="italic text-[var(--accent)]">Blocks</span> & stimuli</h2>
-    <p className="text-[var(--text-2)] mb-6 max-w-4xl">Mỗi project có thể có nhiều Block. EyeLab chạy toàn bộ stimulus trong Block, pause ghi gaze ở Survey, sau đó quick validation rồi mới tiếp tục Block kế tiếp. Câu trả lời survey nằm ở nền tảng form bên ngoài và không được lưu trong EyeLab.</p>
+    <p className="text-[var(--text-2)] mb-6 max-w-4xl">Mỗi project có thể có nhiều Block. Mỗi Block dùng một GazeCloud tracking session riêng; EyeLab stop hoàn toàn tracker trước Survey, rồi calibration lại và quick validation trước Block kế tiếp. Câu trả lời survey nằm ở nền tảng form bên ngoài và không được lưu trong EyeLab.</p>
 
     <div className="panel p-4 mb-6"><div className="grid md:grid-cols-3 gap-3 items-end"><div className="md:col-span-2"><label className="font-mono text-[10px] text-[var(--text-2)] uppercase tracking-widest block mb-2">Tên project</label><input className="input-base" value={projectInfo?.name||''} onChange={e=>onProjectNameChange?.(e.target.value)} /></div><div className="flex gap-2"><button onClick={onSaveProject} className="btn-ghost flex-1">Lưu project</button><button onClick={onCreateProject} className="btn-primary flex-1">+ Project mới</button></div></div></div>
 
@@ -4541,7 +4566,7 @@ function UploadPhase({onNext,stimuli,setStimuli,blocks,setBlocks,projectInfo,onP
             <div className="lg:col-span-3 flex gap-1"><button className="btn-ghost" disabled={i===0} onClick={()=>moveBlock(b.id,-1)}>↑ Block</button><button className="btn-ghost" disabled={i===safeBlocks.length-1} onClick={()=>moveBlock(b.id,1)}>↓ Block</button><button className="btn-danger" onClick={()=>removeBlock(b.id)}>Xoá</button></div>
           </div>
           <div className="flex gap-5 flex-wrap mt-3 font-mono text-[10px] text-[var(--text-2)]">
-            <label className="flex gap-2 items-center"><input type="checkbox" checked={b.surveyAutoDetect!==false} onChange={e=>patchBlock(b.id,{surveyAutoDetect:e.target.checked})}/> Tự chuyển khi iframe reload sau submit</label>
+            <label className="flex gap-2 items-center"><input type="checkbox" checked={b.surveyAutoDetect===true} onChange={e=>patchBlock(b.id,{surveyAutoDetect:e.target.checked})}/> Cho phép form gửi postMessage để tự chuyển</label>
             <label className="flex gap-2 items-center"><input type="checkbox" checked={b.quickValidation!==false} onChange={e=>patchBlock(b.id,{quickValidation:e.target.checked})}/> Quick validation trước block kế</label>
             <span>{stimuli.filter(s=>s.blockId===b.id).length} stimulus</span>
           </div>
@@ -4709,7 +4734,7 @@ function CalibrationPhase({onNext,gazeReady,setGazeReady}){
     const yPx=rawY-window.scrollY;
     const state=data?.state;
     const coordOk=Number.isFinite(xPx)&&Number.isFinite(yPx);
-    const trackingOk=state!==-1&&state!==undefined;
+    const trackingOk=Number(state)===0;
     const phase=elapsed<VALIDATION_SETTLE_MS?'warmup':(elapsed>VALIDATION_POINT_MS-VALIDATION_END_GUARD_MS?'end_guard':'analysis');
     const valid=coordOk&&trackingOk;
     const targetXPx=p.x*window.innerWidth;
@@ -5134,7 +5159,7 @@ function AoiEditor({stimulus,onChange}){
 function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
   const containerRef=useRef(null),mediaStageRef=useRef(null),videoRef=useRef(null),imgRef=useRef(null),dotRef=useRef(null);
   const gazeBufferRef=useRef([]),startTimeRef=useRef(0),isRecordingRef=useRef(false),aoisRef=useRef([]),stimTypeRef=useRef('image'),stimDurationMsRef=useRef(0),imageTimerRef=useRef(null),finalizedRef=useRef(false),advanceLockRef=useRef(false),currentSeqIdxRef=useRef(-1),sequenceRef=useRef([]),startCurrentStimulusRef=useRef(null);
-  const qualityRef=useRef({total:0,valid:0}),quickValidationRef=useRef({active:false,samples:[],nextIdx:null,block:null,start:0}),surveyLoadCountRef=useRef(0),surveyStartedAtRef=useRef(0),surveyCompletionLockRef=useRef(false),gazeHandlerRef=useRef(null),lastGazeCallbackAtRef=useRef(0);
+  const qualityRef=useRef({total:0,valid:0}),quickValidationRef=useRef({active:false,samples:[],nextIdx:null,block:null,start:0}),surveyCompletionLockRef=useRef(false),surveyIframeRef=useRef(null),gazeHandlerRef=useRef(null),lastGazeCallbackAtRef=useRef(0),trackerTransitionRef=useRef(0);
   const [currentSeqIdx,setCurrentSeqIdx]=useState(-1),[isPlaying,setIsPlaying]=useState(false),[stimTime,setStimTime]=useState(0),[duration,setDuration]=useState(0),[sampleCount,setSampleCount]=useState(0),[liveAoi,setLiveAoi]=useState(null),[isFullscreen,setIsFullscreen]=useState(false),[showFixation,setShowFixation]=useState(false),[mediaBox,setMediaBox]=useState({left:0,top:0,width:0,height:0});
   const [flowState,setFlowState]=useState('ready'),[surveyBlock,setSurveyBlock]=useState(null),[pendingNextIdx,setPendingNextIdx]=useState(null),[validationResult,setValidationResult]=useState(null),[recalibrating,setRecalibrating]=useState(false);
   const colors=['#F59E0B','#06B6D4','#10B981','#EC4899','#8B5CF6','#EF4444'];
@@ -5146,7 +5171,7 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
   const commitCurrentIdx=useCallback(idx=>{currentSeqIdxRef.current=idx;setCurrentSeqIdx(idx)},[]);
   const updateMediaBox=useCallback(()=>{const target=stimTypeRef.current==='video'?videoRef.current:imgRef.current,stage=mediaStageRef.current;if(!target||!stage)return;const r=getRenderedMediaRect(target,stage);if(!r||r.width<=0||r.height<=0)return;const next={left:r.left,top:r.top,width:r.width,height:r.height};setMediaBox(prev=>Math.abs(prev.left-next.left)<.5&&Math.abs(prev.top-next.top)<.5&&Math.abs(prev.width-next.width)<.5&&Math.abs(prev.height-next.height)<.5?prev:next)},[]);
 
-  useEffect(()=>{try{window.GazeCloudAPI?.StartEyeTracking?.()}catch(e){};window.EyeLabBlockValidationResults=[]},[]);
+  useEffect(()=>{window.EyeLabBlockValidationResults=[]},[]);
   useEffect(()=>{const onFs=()=>{setIsFullscreen(!!document.fullscreenElement);setTimeout(updateMediaBox,80)};document.addEventListener('fullscreenchange',onFs);window.addEventListener('resize',updateMediaBox);return()=>{document.removeEventListener('fullscreenchange',onFs);window.removeEventListener('resize',updateMediaBox)}},[updateMediaBox]);
   useEffect(()=>{if(currentSeqIdx<0||currentSeqIdx>=sequence.length||showFixation||flowState!=='stimulus')return;updateMediaBox();const t=setInterval(updateMediaBox,200);return()=>clearInterval(t)},[currentSeqIdx,sequence.length,showFixation,isFullscreen,flowState,updateMediaBox]);
 
@@ -5157,12 +5182,12 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
       lastGazeCallbackAtRef.current=performance.now();
       const qv=quickValidationRef.current;
       if(qv.active){
-        const rawX=Number(data?.docX??data?.GazeX??data?.x),rawY=Number(data?.docY??data?.GazeY??data?.y),valid=!!data&&data.state!==-1&&Number.isFinite(rawX)&&Number.isFinite(rawY);
-        qv.samples.push({t:performance.now()-qv.start,x:valid?rawX:null,y:valid?rawY:null,valid,state:data?.state??-1});
+        const rawX=Number(data?.docX??data?.GazeX??data?.x),rawY=Number(data?.docY??data?.GazeY??data?.y),valid=!!data&&Number(data.state)===0&&Number.isFinite(rawX)&&Number.isFinite(rawY);
+        qv.samples.push({t:performance.now()-qv.start,x:valid?rawX-window.scrollX:null,y:valid?rawY-window.scrollY:null,valid,state:data?.state??-1});
       }
       if(!isRecordingRef.current)return;
       qualityRef.current.total++;
-      if(!data||data.state===-1){return}
+      if(!data||Number(data.state)!==0){return}
       const lx=Number(data.docX??data.GazeX??data.x),ly=Number(data.docY??data.GazeY??data.y);if(!Number.isFinite(lx)||!Number.isFinite(ly))return;qualityRef.current.valid++;
       const target=stimTypeRef.current==='video'?videoRef.current:imgRef.current;if(!target)return;const r=getRenderedMediaRect(target,mediaStageRef.current);if(!r||!r.width||!r.height)return;
       const xN=(lx-r.viewportLeft)/r.width,yN=(ly-r.viewportTop)/r.height,inB=xN>=0&&xN<=1&&yN>=0&&yN<=1;let stimT=stimTypeRef.current==='video'&&videoRef.current?videoRef.current.currentTime:(nowMs()-startTimeRef.current)/1000;
@@ -5181,25 +5206,45 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
     const total=qualityRef.current.total||0,valid=qualityRef.current.valid||0;updateStimulus(stim.id,{gazeData:dataCopy,durationMs:dur,blockId:stim.blockId||stim._blockId,quality:{totalCallbacks:total,validCallbacks:valid,validPct:total?valid/total*100:0}});
   },[updateStimulus]);
 
-  const requestStimulusFullscreen=useCallback(async()=>{try{if(containerRef.current?.requestFullscreen)await containerRef.current.requestFullscreen();else if(containerRef.current?.webkitRequestFullscreen)containerRef.current.webkitRequestFullscreen()}catch(e){console.warn('Fullscreen unavailable',e)}},[]);
+  const requestStimulusFullscreen=useCallback(async()=>{try{if(document.fullscreenElement)return true;const target=containerRef.current||document.documentElement;if(target?.requestFullscreen){await target.requestFullscreen();return !!document.fullscreenElement}if(target?.webkitRequestFullscreen){target.webkitRequestFullscreen();return true}return false}catch(e){console.warn('Fullscreen unavailable',e);return false}},[]);
 
   const startCurrentStimulus=useCallback(idx=>{
     const list=sequenceRef.current,stim=list[idx];if(!stim)return;currentSeqIdxRef.current=idx;aoisRef.current=normalizeAoisForStimulus(stim);stimTypeRef.current=stim.type;stimDurationMsRef.current=Number(stim.displayDurationSec||DEFAULT_IMAGE_DURATION_SEC)*1000;gazeBufferRef.current=[];qualityRef.current={total:0,valid:0};setSampleCount(0);setLiveAoi(null);setStimTime(0);setMediaBox({left:0,top:0,width:0,height:0});setFlowState('stimulus');
     if(imageTimerRef.current){clearTimeout(imageTimerRef.current);imageTimerRef.current=null}
     if(stim.type==='video'){
       const v=videoRef.current;if(v){v.currentTime=0;startTimeRef.current=nowMs();isRecordingRef.current=true;setIsPlaying(true);setDuration(v.duration||stim.displayDurationSec);setTimeout(updateMediaBox,100);const pp=v.play();if(pp?.catch)pp.catch(()=>{})}
-    }else{startTimeRef.current=nowMs();isRecordingRef.current=true;setIsPlaying(true);setDuration(stim.displayDurationSec);setTimeout(updateMediaBox,100);imageTimerRef.current=setTimeout(()=>advanceStimulusRef.current?.(),Number(stim.displayDurationSec||DEFAULT_IMAGE_DURATION_SEC)*1000)}
+    }else{
+      const imageDurationSec=Math.max(0.1,Number(stim.displayDurationSec)||DEFAULT_IMAGE_DURATION_SEC),imageDurationMs=imageDurationSec*1000;
+      startTimeRef.current=nowMs();stimDurationMsRef.current=imageDurationMs;isRecordingRef.current=true;setIsPlaying(true);setDuration(imageDurationSec);setTimeout(updateMediaBox,100);
+      const finishAt=startTimeRef.current+imageDurationMs;
+      const checkImageDeadline=()=>{
+        const remaining=finishAt-nowMs();
+        if(remaining<=0){imageTimerRef.current=null;isRecordingRef.current=false;setIsPlaying(false);setStimTime(imageDurationSec);requestAnimationFrame(()=>advanceStimulusRef.current?.());return}
+        imageTimerRef.current=setTimeout(checkImageDeadline,Math.min(100,Math.max(0,remaining)));
+      };
+      imageTimerRef.current=setTimeout(checkImageDeadline,Math.min(100,imageDurationMs));
+    }
   },[updateMediaBox]);
   useEffect(()=>{startCurrentStimulusRef.current=startCurrentStimulus},[startCurrentStimulus]);
 
-  const resumeAt=useCallback(async idx=>{setSurveyBlock(null);setValidationResult(null);setPendingNextIdx(null);setShowFixation(true);setFlowState('transition');await requestStimulusFullscreen();commitCurrentIdx(idx);setTimeout(()=>{setShowFixation(false);startCurrentStimulusRef.current?.(idx);advanceLockRef.current=false},800)},[commitCurrentIdx,requestStimulusFullscreen]);
+  const resumeAt=useCallback(async idx=>{const enteredFullscreen=await requestStimulusFullscreen();if(!enteredFullscreen){alert('Trình duyệt chưa cho phép fullscreen. Hãy bấm lại nút Bắt đầu Block (Fullscreen) và cho phép toàn màn hình.');return}setSurveyBlock(null);setValidationResult(null);setPendingNextIdx(null);setShowFixation(true);setFlowState('transition');commitCurrentIdx(idx);setTimeout(()=>{setShowFixation(false);startCurrentStimulusRef.current?.(idx);advanceLockRef.current=false},800)},[commitCurrentIdx,requestStimulusFullscreen]);
+
+  const prepareNextBlock=useCallback((idx,block)=>{setPendingNextIdx(idx);setSurveyBlock(block);setValidationResult(null);setIsPlaying(false);isRecordingRef.current=false;setFlowState('block_ready')},[]);
+
+  const stopTracker=useCallback(()=>{
+    trackerTransitionRef.current++;
+    isRecordingRef.current=false;quickValidationRef.current.active=false;
+    try{if(window.GazeCloudAPI)GazeCloudAPI.OnResult=null}catch(e){}
+    try{window.GazeCloudAPI?.StopEyeTracking?.()}catch(e){console.warn('Could not stop GazeCloud',e)}
+  },[]);
+  useEffect(()=>()=>stopTracker(),[stopTracker]);
 
   const runQuickValidation=useCallback(async(nextIdx,block)=>{
     setPendingNextIdx(nextIdx);setSurveyBlock(block);setFlowState('validation');setValidationResult(null);setIsPlaying(false);isRecordingRef.current=false;
     try{if(document.fullscreenElement)await document.exitFullscreen()}catch(e){}
     // Quick validation has its own gaze buffer. It does NOT depend on stimulus recording.
     // Re-bind OnResult in case another phase/library callback replaced it while the survey was open.
-    try{if(window.GazeCloudAPI&&gazeHandlerRef.current)GazeCloudAPI.OnResult=gazeHandlerRef.current;if(window.GazeCloudAPI)GazeCloudAPI.StartEyeTracking?.()}catch(e){}
+    try{if(window.GazeCloudAPI&&gazeHandlerRef.current)GazeCloudAPI.OnResult=gazeHandlerRef.current}catch(e){}
     await sleep(650);
     const qv={active:true,samples:[],nextIdx,block,start:performance.now()};quickValidationRef.current=qv;
     // Give GazeCloud a little longer to recover after leaving the survey / fullscreen.
@@ -5209,12 +5254,14 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
     const pass=!noCallbacks&&!trackingLost&&Number.isFinite(errorPx)&&errorPx<=thresholdPx&&validPct>=60&&valid.length>=5;
     const reason=noCallbacks?'no_live_gaze':trackingLost?'tracking_lost':pass?'pass':'accuracy_fail';
     const result={createdAt:new Date().toISOString(),blockId:block?.id||'',blockName:block?.name||'',target:'center',samples:analysis.length,validSamples:valid.length,validPct,errorPx,thresholdPx,pass,reason};window.EyeLabBlockValidationResults=[...(window.EyeLabBlockValidationResults||[]),result];setValidationResult(result);
-    if(pass){setTimeout(()=>resumeAt(nextIdx),700)}else setFlowState('validation_fail');
-  },[resumeAt]);
+    if(pass){setTimeout(()=>prepareNextBlock(nextIdx,block),700)}else setFlowState('validation_fail');
+  },[prepareNextBlock]);
 
-  const recalibrateAndRetry=useCallback(()=>{
-    if(!window.GazeCloudAPI)return;
-    const next=pendingNextIdx,block=surveyBlock;
+  const startTrackerForNextBlock=useCallback((next,block)=>{
+    if(!window.GazeCloudAPI){setFlowState('validation_fail');setValidationResult({reason:'no_live_gaze'});return}
+    stopTracker();
+    const transitionId=++trackerTransitionRef.current;
+    setPendingNextIdx(next);setSurveyBlock(block);setValidationResult(null);
     setRecalibrating(true);
     setFlowState('recalibration_handoff');
     document.body.classList.add('eyelab-recalibrating');
@@ -5230,39 +5277,34 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
       }catch(e){}
     };
     const fail=(msg)=>{
-      if(finished)return;
+      if(finished||transitionId!==trackerTransitionRef.current)return;
       finished=true;
       cleanup();
       setRecalibrating(false);
       setFlowState('validation_fail');
+      setValidationResult({reason:'no_live_gaze'});
       if(msg)alert(msg);
     };
 
     try{
-      // Recalibration is started as a fresh GazeCloud session. We intentionally DO NOT
-      // auto-click the internal calibration button. The participant sees the same
-      // face-position screen as the initial calibration and clicks Start Gaze Calibration
-      // once GazeCloud has detected a stable face. This avoids stale/disabled-button races.
       GazeCloudAPI.OnCalibrationComplete=()=>{
-        if(finished)return;
+        if(finished||transitionId!==trackerTransitionRef.current)return;
         finished=true;
         cleanup();
         try{if(gazeHandlerRef.current)GazeCloudAPI.OnResult=gazeHandlerRef.current}catch(e){}
         setRecalibrating(false);
-        setTimeout(()=>runQuickValidation(next,block),1200);
+        setTimeout(()=>{if(block?.quickValidation!==false)runQuickValidation(next,block);else prepareNextBlock(next,block)},1200);
       };
       GazeCloudAPI.OnCalibrationFail=()=>fail('Calibration không thành công. Hãy kiểm tra webcam, ánh sáng và vị trí khuôn mặt rồi thử lại.');
       GazeCloudAPI.OnCamDenied=()=>fail('Không truy cập được camera. Hãy cấp quyền camera cho trang EyeLab rồi thử lại.');
+      GazeCloudAPI.OnError=msg=>fail(String(msg||'GazeCloudAPI error'));
 
-      try{GazeCloudAPI.StopEyeTracking?.()}catch(e){}
       setTimeout(()=>{
-        if(finished)return;
+        if(finished||transitionId!==trackerTransitionRef.current)return;
         try{
-          if(gazeHandlerRef.current)GazeCloudAPI.OnResult=gazeHandlerRef.current;
           GazeCloudAPI.StartEyeTracking?.();
-          // Let GazeCloud own the screen. Its camera/face-position UI will become visible
-          // when initialization finishes; the calibration button enables only when ready.
           setTimeout(()=>{
+            if(finished||transitionId!==trackerTransitionRef.current)return;
             try{
               const gfc=document.getElementById('GazeFlowContainer');if(gfc)gfc.style.display='block';
               const cam=document.getElementById('camid');if(cam){cam.style.zIndex='30020';}
@@ -5271,32 +5313,48 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
         }catch(e){fail('Không thể khởi động lại eye tracking: '+(e?.message||String(e)))}
       },700);
     }catch(e){fail('Không thể calibration lại: '+(e?.message||String(e)))}
-  },[pendingNextIdx,surveyBlock,runQuickValidation]);
+  },[runQuickValidation,prepareNextBlock,stopTracker]);
+
+  const recalibrateAndRetry=useCallback(()=>startTrackerForNextBlock(pendingNextIdx,surveyBlock),[pendingNextIdx,surveyBlock,startTrackerForNextBlock]);
+
+  const finishSession=useCallback(()=>{stopTracker();setSurveyBlock(null);setPendingNextIdx(null);commitCurrentIdx(sequenceRef.current.length);setIsPlaying(false);setFlowState('done');try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}setTimeout(()=>{if(!finalizedRef.current){finalizedRef.current=true;onNext()}},250)},[commitCurrentIdx,onNext,stopTracker]);
+
+  const showSurvey=useCallback(async(block,nextIdx)=>{stopTracker();setIsPlaying(false);setLiveAoi(null);setPendingNextIdx(nextIdx);setSurveyBlock(block);surveyCompletionLockRef.current=false;try{if(document.fullscreenElement)await document.exitFullscreen()}catch(e){}setFlowState('survey')},[stopTracker]);
 
   const completeSurvey=useCallback(()=>{
-    if(surveyCompletionLockRef.current)return;surveyCompletionLockRef.current=true;const next=pendingNextIdx,block=surveyBlock;if(block?.quickValidation!==false)runQuickValidation(next,block).finally(()=>{surveyCompletionLockRef.current=false});else resumeAt(next).finally(()=>{surveyCompletionLockRef.current=false});
-  },[pendingNextIdx,surveyBlock,runQuickValidation,resumeAt]);
+    if(surveyCompletionLockRef.current)return;
+    surveyCompletionLockRef.current=true;
+    const next=pendingNextIdx,block=surveyBlock;
+    if(next==null||next>=sequenceRef.current.length){finishSession();return}
+    startTrackerForNextBlock(next,block);
+  },[pendingNextIdx,surveyBlock,finishSession,startTrackerForNextBlock]);
 
   useEffect(()=>{
-    const onMsg=e=>{if(flowState!=='survey')return;const d=e.data;if(d==='eyelab-survey-complete'||d?.type==='eyelab-survey-complete')completeSurvey()};window.addEventListener('message',onMsg);return()=>window.removeEventListener('message',onMsg)
-  },[flowState,completeSurvey]);
-
-  const showSurvey=useCallback(async(block,nextIdx)=>{isRecordingRef.current=false;setIsPlaying(false);setLiveAoi(null);setPendingNextIdx(nextIdx);setSurveyBlock(block);surveyLoadCountRef.current=0;surveyStartedAtRef.current=performance.now();surveyCompletionLockRef.current=false;try{if(document.fullscreenElement)await document.exitFullscreen()}catch(e){}setFlowState('survey')},[]);
-
-  const finishSession=useCallback(()=>{commitCurrentIdx(sequenceRef.current.length);setIsPlaying(false);setFlowState('done');try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}setTimeout(()=>{if(!finalizedRef.current){finalizedRef.current=true;onNext()}},250)},[commitCurrentIdx,onNext]);
+    const onMsg=e=>{
+      if(flowState!=='survey'||surveyBlock?.surveyAutoDetect!==true)return;
+      let expectedOrigin='';try{expectedOrigin=new URL(surveyBlock.surveyUrl,location.href).origin}catch(err){return}
+      if(e.source!==surveyIframeRef.current?.contentWindow||e.origin!==expectedOrigin)return;
+      const d=e.data;if(d==='eyelab-survey-complete'||d?.type==='eyelab-survey-complete')completeSurvey();
+    };
+    window.addEventListener('message',onMsg);return()=>window.removeEventListener('message',onMsg)
+  },[flowState,surveyBlock,completeSurvey]);
 
   const advanceStimulusRef=useRef(null);
   const advanceStimulus=useCallback(()=>{
     if(advanceLockRef.current)return;advanceLockRef.current=true;const list=sequenceRef.current,idx=currentSeqIdxRef.current;persistCurrent();const next=idx+1;
-    if(next>=list.length){finishSession();return}
-    const cur=list[idx],nxt=list[next],blockChanged=cur?._blockId!==nxt?._blockId;
-    if(blockChanged){const b=cur?._block||normalizeBlocks(blocks,stimuli).find(x=>x.id===cur?._blockId);if(b?.surveyUrl){showSurvey(b,next);return}if(b?.quickValidation!==false){runQuickValidation(next,b);return}}
+    const cur=list[idx],nxt=list[next],isFinal=next>=list.length,blockChanged=isFinal||(cur?._blockId!==nxt?._blockId);
+    if(blockChanged){
+      const b=cur?._block||normalizeBlocks(blocks,stimuli).find(x=>x.id===cur?._blockId);
+      if(b?.surveyUrl){showSurvey(b,next);return}
+      if(isFinal){finishSession();return}
+      startTrackerForNextBlock(next,b);return;
+    }
     setShowFixation(true);setIsPlaying(false);setLiveAoi(null);setFlowState('transition');setTimeout(()=>{setShowFixation(false);commitCurrentIdx(next);setSampleCount(0);setStimTime(0);setMediaBox({left:0,top:0,width:0,height:0});gazeBufferRef.current=[];setTimeout(()=>{startCurrentStimulusRef.current?.(next);advanceLockRef.current=false},120)},800)
-  },[persistCurrent,finishSession,blocks,stimuli,showSurvey,runQuickValidation,commitCurrentIdx]);
+  },[persistCurrent,finishSession,blocks,stimuli,showSurvey,startTrackerForNextBlock,commitCurrentIdx]);
   useEffect(()=>{advanceStimulusRef.current=advanceStimulus},[advanceStimulus]);
 
   useEffect(()=>{const stim=sequence[currentSeqIdx];if(!stim||stim.type!=='video'||flowState!=='stimulus')return;const v=videoRef.current;if(!v)return;const onTime=()=>{setStimTime(v.currentTime);updateMediaBox()},onLoad=()=>{setDuration(v.duration||stim.displayDurationSec);setTimeout(updateMediaBox,60)},onEnd=()=>advanceStimulusRef.current?.();v.addEventListener('timeupdate',onTime);v.addEventListener('loadedmetadata',onLoad);v.addEventListener('loadeddata',onLoad);v.addEventListener('ended',onEnd);return()=>{v.removeEventListener('timeupdate',onTime);v.removeEventListener('loadedmetadata',onLoad);v.removeEventListener('loadeddata',onLoad);v.removeEventListener('ended',onEnd)}},[currentSeqIdx,sequence,flowState,updateMediaBox]);
-  useEffect(()=>{const stim=sequence[currentSeqIdx];if(!stim||stim.type!=='image'||!isPlaying||flowState!=='stimulus')return;const tick=setInterval(()=>setStimTime((performance.now()-startTimeRef.current)/1000),100);return()=>clearInterval(tick)},[currentSeqIdx,isPlaying,flowState,sequence]);
+  useEffect(()=>{const stim=sequence[currentSeqIdx];if(!stim||stim.type!=='image'||!isPlaying||flowState!=='stimulus')return;const total=Math.max(0.1,Number(stim.displayDurationSec)||DEFAULT_IMAGE_DURATION_SEC);const tick=setInterval(()=>setStimTime(Math.min(total,(performance.now()-startTimeRef.current)/1000)),100);return()=>clearInterval(tick)},[currentSeqIdx,isPlaying,flowState,sequence]);
 
   const beginSession=async()=>{finalizedRef.current=false;advanceLockRef.current=false;await requestStimulusFullscreen();commitCurrentIdx(0);setShowFixation(true);setFlowState('transition');setTimeout(()=>{setShowFixation(false);startCurrentStimulusRef.current?.(0);advanceLockRef.current=false},800)};
   const stopAll=()=>{persistCurrent();try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}finishSession()};
@@ -5305,12 +5363,13 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
   const stim=currentSeqIdx>=0&&currentSeqIdx<sequence.length?sequence[currentSeqIdx]:null,progress=duration?Math.min(100,(stimTime/duration)*100):0,safeIdx=Math.max(0,Math.min(currentSeqIdx,sequence.length)),overallProgress=sequence.length?((safeIdx+(progress/100))/sequence.length)*100:0;
 
   if(flowState==='survey'&&surveyBlock){return <div>
-    <div className="font-mono text-[10px] text-[var(--accent)] uppercase tracking-[0.3em] mb-4">SURVEY GATE / {surveyBlock.name}</div><h2 className="font-display text-4xl mb-2">{surveyBlock.surveyTitle||'Khảo sát'}</h2><p className="text-[var(--text-2)] mb-4">Gaze recording đang <span className="text-[var(--success)] font-mono">PAUSED</span>. Hoàn tất form bên dưới; EyeLab sẽ tự chuyển khi phát hiện form reload sau submit. Nếu không tự chuyển, dùng nút xác nhận.</p>
-    <div className="panel overflow-hidden"><iframe title={surveyBlock.surveyTitle||'Survey'} src={surveyBlock.surveyUrl} style={{width:'100%',height:'70vh',border:0,background:'#fff'}} onLoad={()=>{surveyLoadCountRef.current++;if(surveyBlock.surveyAutoDetect!==false&&surveyLoadCountRef.current>=2&&performance.now()-surveyStartedAtRef.current>2500)setTimeout(completeSurvey,500)}} /></div>
-    <div className="mt-4 flex justify-between items-center gap-3"><div className="font-mono text-[10px] text-[var(--text-3)]">Survey responses không được EyeLab đọc hoặc lưu.</div><button onClick={completeSurvey} className="btn-primary">✓ Tôi đã hoàn tất khảo sát → Tiếp tục</button></div>
+    <div className="font-mono text-[10px] text-[var(--accent)] uppercase tracking-[0.3em] mb-4">SURVEY GATE / {surveyBlock.name}</div><h2 className="font-display text-4xl mb-2">{surveyBlock.surveyTitle||'Khảo sát'}</h2><p className="text-[var(--text-2)] mb-4">GazeCloud đã <span className="text-[var(--success)] font-mono">STOPPED</span> hoàn toàn trong lúc làm khảo sát. Sau khi hoàn tất, EyeLab sẽ mở một tracking session mới và calibration lại trước Block kế tiếp.</p>
+    <div className="panel overflow-hidden"><iframe ref={surveyIframeRef} title={surveyBlock.surveyTitle||'Survey'} src={surveyBlock.surveyUrl} style={{width:'100%',height:'70vh',border:0,background:'#fff'}} /></div>
+    <div className="mt-4 flex justify-between items-center gap-3"><div className="font-mono text-[10px] text-[var(--text-3)]">Survey responses không được EyeLab đọc hoặc lưu.{surveyBlock.surveyAutoDetect===true?' Form tùy chỉnh có thể tự chuyển bằng postMessage đã xác thực.':''}</div><button onClick={completeSurvey} className="btn-primary">✓ Tôi đã hoàn tất khảo sát → Tiếp tục</button></div>
   </div>}
 
-  if(flowState==='recalibration_handoff'){return <div className="fixed inset-0 z-[50] bg-white text-black flex items-end justify-center pb-8"><div className="font-mono text-xs text-black/40">GazeCloud đang khởi động lại — giữ khuôn mặt trong khung camera và bấm Start Gaze Calibration khi nút sáng lên.</div></div>}
+  if(flowState==='recalibration_handoff'){return <div className="fixed inset-0 z-[50] bg-white text-black flex items-end justify-center pb-8"><div className="font-mono text-xs text-black/40">Đang bắt đầu tracking session cho Block kế tiếp — giữ khuôn mặt trong khung camera và bấm Start Gaze Calibration khi nút sáng lên.</div></div>}
+  if(flowState==='block_ready'){const nextStim=sequence[pendingNextIdx];return <div className="fixed inset-0 z-[24000] bg-white text-black flex items-center justify-center"><div className="text-center max-w-xl px-6"><div className="font-mono text-xs text-black/50 uppercase tracking-widest mb-5">EyeLab · Block ready</div><h2 className="text-3xl font-semibold mb-3">Calibration đã hoàn tất</h2><p className="text-black/60 mb-6">Bấm nút bên dưới để mở <b>{nextStim?._block?.name||'Block tiếp theo'}</b> ở chế độ toàn màn hình. Trình duyệt chỉ cho phép EyeLab bật fullscreen trực tiếp từ thao tác click này.</p><button onClick={()=>resumeAt(pendingNextIdx)} className="btn-primary">▶ Bắt đầu {nextStim?._block?.name||'Block tiếp theo'} (Fullscreen)</button></div></div>}
   if(['validation','validation_fail','recalibrating'].includes(flowState)){return <div className={`fixed inset-0 ${flowState==='recalibrating'?'z-[50]':'z-[24000]'} bg-white text-black flex items-center justify-center`}><div className="text-center max-w-xl px-6">
     <div className="font-mono text-xs text-black/50 uppercase tracking-widest mb-5">EyeLab · Between-block quality check</div>
     {flowState==='validation'?<><div className="w-[84px] h-[84px] rounded-full border-[6px] border-red-500 bg-red-500/10 mx-auto mb-6"></div><h2 className="text-3xl font-semibold mb-3">Nhìn vào chấm đỏ ở giữa màn hình</h2><p className="text-black/60">EyeLab đang thu gaze bằng bộ đệm validation riêng (không ghi vào dữ liệu stimulus). Giữ đầu ổn định trong vài giây.</p></>:flowState==='recalibrating'?<><h2 className="text-3xl font-semibold mb-3">Đang khởi động lại eye tracking…</h2><p className="text-black/60">EyeLab đang mở lại camera/GazeCloud. Khi tracker nhận diện khuôn mặt, calibration sẽ tự xuất hiện.</p></>:<><h2 className="text-3xl font-semibold mb-3">{validationResult?.reason==='no_live_gaze'?'Không nhận được gaze từ GazeCloud':validationResult?.reason==='tracking_lost'?'GazeCloud đang mất tracking':'Quick validation chưa đạt'}</h2>{validationResult?.reason==='no_live_gaze'?<p className="text-black/60 mb-6">Không có callback gaze trong thời gian kiểm tra. Đây là lỗi trạng thái tracking, không phải kết luận calibration kém. Hãy thử kiểm tra lại; nếu vẫn vậy, calibration lại sẽ restart hẳn GazeCloud.</p>:validationResult?.reason==='tracking_lost'?<p className="text-black/60 mb-6">Có callback từ GazeCloud nhưng toàn bộ ở trạng thái mất tracking. Hãy kiểm tra khuôn mặt, ánh sáng và webcam.</p>:<><p className="text-black/60 mb-3">Median error: <b>{fmt(validationResult?.errorPx,0)} px</b> · ngưỡng: {fmt(validationResult?.thresholdPx,0)} px · valid gaze: {fmt(validationResult?.validPct,0)}%</p><p className="text-black/60 mb-6">Calibration hiện tại chưa đủ chính xác cho Block tiếp theo.</p></>}<div className="flex gap-3 justify-center"><button onClick={()=>runQuickValidation(pendingNextIdx,surveyBlock)} className="btn-ghost">↻ Kiểm tra lại</button><button onClick={recalibrateAndRetry} className="btn-primary">◎ Restart & Calibration lại</button></div></>}
@@ -5864,7 +5923,7 @@ function AdminComplete({stimuli,blocks,projectInfo,onProjectNameChange,onBack,on
 }
 
 function App(){
-  const [storageReady,setStorageReady]=useState(false),[mode,setMode]=useState(null),[phase,setPhase]=useState('upload'),[demographics,setDemographics]=useState({participantId:'P001',name:'',age:'',gender:'',education:'',email:'',consent:false}),[stimuli,setStimuli]=useState([]),[blocks,setBlocks]=useState([]),[projectInfo,setProjectInfo]=useState({id:null,name:DEFAULT_PROJECT_NAME,createdAt:null,publicSlug:'',isPublished:false,isRemote:false}),[projects,setProjects]=useState([]),[gazeReady,setGazeReady]=useState(false),[sessionId,setSessionId]=useState(generateSessionId()),[remoteLoadError,setRemoteLoadError]=useState(null);
+  const [storageReady,setStorageReady]=useState(false),[mode,setMode]=useState(null),[phase,setPhase]=useState('upload'),[demographics,setDemographics]=useState({participantId:'',name:'',age:'',gender:'',education:'',email:'',consent:false}),[stimuli,setStimuli]=useState([]),[blocks,setBlocks]=useState([]),[projectInfo,setProjectInfo]=useState({id:null,name:DEFAULT_PROJECT_NAME,createdAt:null,publicSlug:'',isPublished:false,isRemote:false}),[projects,setProjects]=useState([]),[gazeReady,setGazeReady]=useState(false),[sessionId,setSessionId]=useState(generateSessionId()),[remoteLoadError,setRemoteLoadError]=useState(null);
 
   const refreshProjects=useCallback(async()=>{const list=await loadProjectList();setProjects(list);return list},[]);
   const applyProject=useCallback(p=>{if(!p){setProjectInfo({id:null,name:DEFAULT_PROJECT_NAME,createdAt:null,publicSlug:'',isPublished:false,isRemote:false});setStimuli([]);setBlocks(normalizeBlocks([],[]));return}const hyd=hydrateStoredStimuli(p.stimuli);const bs=normalizeBlocks(p.blocks||[],hyd);setStimuli([...hyd]);setBlocks(bs);setProjectInfo({id:p.id,name:p.name||DEFAULT_PROJECT_NAME,createdAt:p.createdAt||null,publicSlug:p.publicSlug||'',isPublished:!!p.isPublished,isRemote:!!p.isRemote})},[]);
