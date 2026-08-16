@@ -14,7 +14,7 @@
    The publishable/anon key is intended for browser clients; NEVER paste a service_role/secret key here. */
 window.EYELAB_REMOTE_CONFIG = {
   supabaseUrl: 'https://satwcyeuajsdqvownaph.supabase.co',
-  anonKey: 'sb_publishable_hpVznhPxhXRjy_08tGEBww_QqXLtJIg',
+  anonKey: 'sb_publishable_IfwLzgd3mESU814IHDv1qw_W5jeJFbO',
   projectTable: 'eyelab_projects',
   sessionTable: 'eyelab_eye_tracking_sessions',
   storageBucket: 'eyelab-stimuli'
@@ -3588,7 +3588,7 @@ async function publishProjectRemote(stimuli,blocks,projectInfo){
     if(String(st.dataUrl||st.url||'').startsWith('data:')){
       const blob=dataUrlToBlob(st.dataUrl||st.url);const ext=(st.fileName?.split('.').pop()|| (st.type==='video'?'mp4':'png')).replace(/[^a-zA-Z0-9]/g,'').toLowerCase();
       const path=`${projectInfo.id}/${st.id}-${slug(st.fileName||st.name)}.${ext}`;
-      const {error:upErr}=await sb.storage.from(REMOTE_CONFIG.storageBucket||'eyelab-stimuli').upload(path,blob,{contentType:blob.type||undefined,upsert:true,cacheControl:'60'});if(upErr)throw upErr;
+      const {error:upErr}=await sb.storage.from(REMOTE_CONFIG.storageBucket||'eyelab-stimuli').upload(path,blob,{contentType:blob.type||undefined,upsert:true,cacheControl:'86400'});if(upErr)throw upErr;
       const {data:pub}=sb.storage.from(REMOTE_CONFIG.storageBucket||'eyelab-stimuli').getPublicUrl(path);remoteUrl=pub?.publicUrl||'';
     }else remoteUrl=st.remoteUrl||st.dataUrl||st.url;
     if(!remoteUrl)throw new Error(`Không tạo được public URL cho stimulus ${st.name}.`);
@@ -4376,7 +4376,7 @@ function exportRawCSV({sessionId,demographics,stimulusResults}){
 // SHELL
 // ============================================================
 function Shell({phase,children}){
-  const phases=[{id:'welcome',label:'Thông tin'},{id:'upload',label:'Tải stimuli'},{id:'calibration',label:'Hiệu chuẩn'},{id:'aoi',label:'Định nghĩa AOI'},{id:'recording',label:'Ghi dữ liệu'},{id:'results',label:'Kết quả'}];
+  const phases=[{id:'welcome',label:'Thông tin'},{id:'preload',label:'Chuẩn bị media'},{id:'upload',label:'Tải stimuli'},{id:'calibration',label:'Hiệu chuẩn'},{id:'aoi',label:'Định nghĩa AOI'},{id:'recording',label:'Ghi dữ liệu'},{id:'results',label:'Kết quả'}];
   const idx=phases.findIndex(p=>p.id===phase);
   return(
     <div className="min-h-screen bg-grid">
@@ -5153,15 +5153,41 @@ function AoiEditor({stimulus,onChange}){
   );
 }
 
+const EYELAB_STIMULUS_PRELOAD_CACHE=new Map();
+function preloadEyeLabStimulusAsset(stim){
+  const key=`${stim?.type||'image'}:${stim?.url||''}`;if(!stim?.url)return Promise.reject(new Error(`Stimulus ${stim?.name||''} không có URL.`));
+  if(EYELAB_STIMULUS_PRELOAD_CACHE.has(key))return EYELAB_STIMULUS_PRELOAD_CACHE.get(key);
+  const promise=new Promise((resolve,reject)=>{
+    let settled=false;const finish=(err,asset)=>{if(settled)return;settled=true;clearTimeout(timeout);err?reject(err):resolve(asset)},timeout=setTimeout(()=>finish(new Error(`Tải stimulus quá thời gian: ${stim.name||stim.url}`)),45000);
+    if(stim.type==='video'){
+      const v=document.createElement('video');v.preload='auto';v.muted=true;v.playsInline=true;const ready=()=>finish(null,v),fail=()=>finish(new Error(`Không tải được video: ${stim.name||stim.url}`));v.addEventListener('loadeddata',ready,{once:true});v.addEventListener('canplay',ready,{once:true});v.addEventListener('error',fail,{once:true});v.src=stim.url;try{v.load()}catch(e){fail()}
+    }else{
+      const img=new Image();img.decoding='async';img.onload=async()=>{try{if(img.decode)await img.decode()}catch(e){}finish(null,img)};img.onerror=()=>finish(new Error(`Không tải được ảnh: ${stim.name||stim.url}`));img.src=stim.url;
+    }
+  });
+  const guarded=promise.catch(err=>{EYELAB_STIMULUS_PRELOAD_CACHE.delete(key);throw err});EYELAB_STIMULUS_PRELOAD_CACHE.set(key,guarded);return guarded;
+}
+
+function ParticipantPreloadPhase({stimuli,blocks,onNext}){
+  const sequence=useMemo(()=>orderedStimuliByBlocks(stimuli,blocks),[stimuli,blocks]),firstBlockId=sequence[0]?._blockId,items=useMemo(()=>sequence.filter(s=>s._blockId===firstBlockId),[sequence,firstBlockId]);
+  const [status,setStatus]=useState({loaded:0,total:items.length}),[error,setError]=useState(null),[ready,setReady]=useState(false),runIdRef=useRef(0);
+  const run=useCallback(async()=>{const runId=++runIdRef.current;setError(null);setReady(false);setStatus({loaded:0,total:items.length});try{let loaded=0;await Promise.all(items.map(item=>preloadEyeLabStimulusAsset(item).then(()=>{if(runId!==runIdRef.current)return;loaded++;setStatus({loaded,total:items.length})})));if(runId===runIdRef.current)setReady(true)}catch(e){if(runId===runIdRef.current)setError(e?.message||String(e))}},[items]);
+  useEffect(()=>{run();return()=>{runIdRef.current++}},[run]);
+  const pct=status.total?Math.round(status.loaded/status.total*100):0;
+  return <div className="max-w-2xl mx-auto"><div className="font-mono text-[10px] text-[var(--accent)] uppercase tracking-[0.3em] mb-4">PHASE 02 / PRELOAD STIMULI</div><h2 className="font-display text-4xl mb-2">Chuẩn bị media</h2><p className="text-[var(--text-2)] mb-6">EyeLab tải và giải mã toàn bộ stimulus của Block đầu tiên trước khi mở GazeCloud. Thời gian này không được tính vào tracking session hoặc thời lượng stimulus.</p><div className="panel p-6"><div className="flex justify-between font-mono text-xs mb-3"><span>{sequence[0]?._block?.name||'Block 1'}</span><span>{status.loaded}/{status.total} · {pct}%</span></div><div className="h-2 bg-[var(--bg)] overflow-hidden mb-5"><div className="h-full bg-[var(--accent)] transition-all" style={{width:`${pct}%`}}></div></div>{error?<><div className="text-[var(--danger)] font-mono text-xs mb-4">{error}</div><button onClick={run} className="btn-primary">↻ Thử tải lại</button></>:ready?<div className="flex items-center justify-between gap-3"><span className="font-mono text-xs text-[var(--success)]">✓ Media đã sẵn sàng</span><button onClick={onNext} className="btn-primary">Tiếp tục → Hiệu chuẩn</button></div>:<div className="font-mono text-xs text-[var(--text-3)]">Đang tải stimulus…</div>}</div></div>;
+}
+
 // ============================================================
 // PHASE 05 — RECORDING (sequential multi-stimulus, fullscreen)
 // ============================================================
 function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
   const containerRef=useRef(null),mediaStageRef=useRef(null),videoRef=useRef(null),imgRef=useRef(null),dotRef=useRef(null);
   const gazeBufferRef=useRef([]),startTimeRef=useRef(0),isRecordingRef=useRef(false),aoisRef=useRef([]),stimTypeRef=useRef('image'),stimDurationMsRef=useRef(0),imageTimerRef=useRef(null),finalizedRef=useRef(false),advanceLockRef=useRef(false),currentSeqIdxRef=useRef(-1),sequenceRef=useRef([]),startCurrentStimulusRef=useRef(null);
+  const initialPreloadStartedRef=useRef(false),preloadContextRef=useRef('initial');
   const qualityRef=useRef({total:0,valid:0}),quickValidationRef=useRef({active:false,samples:[],nextIdx:null,block:null,start:0}),surveyCompletionLockRef=useRef(false),surveyIframeRef=useRef(null),gazeHandlerRef=useRef(null),lastGazeCallbackAtRef=useRef(0),trackerTransitionRef=useRef(0);
   const [currentSeqIdx,setCurrentSeqIdx]=useState(-1),[isPlaying,setIsPlaying]=useState(false),[stimTime,setStimTime]=useState(0),[duration,setDuration]=useState(0),[sampleCount,setSampleCount]=useState(0),[liveAoi,setLiveAoi]=useState(null),[isFullscreen,setIsFullscreen]=useState(false),[showFixation,setShowFixation]=useState(false),[mediaBox,setMediaBox]=useState({left:0,top:0,width:0,height:0});
   const [flowState,setFlowState]=useState('ready'),[surveyBlock,setSurveyBlock]=useState(null),[pendingNextIdx,setPendingNextIdx]=useState(null),[validationResult,setValidationResult]=useState(null),[recalibrating,setRecalibrating]=useState(false);
+  const [preloadStatus,setPreloadStatus]=useState({loaded:0,total:0,blockName:'',ready:false}),[preloadError,setPreloadError]=useState(null),[initialBlockReady,setInitialBlockReady]=useState(false);
   const colors=['#F59E0B','#06B6D4','#10B981','#EC4899','#8B5CF6','#EF4444'];
 
   const sequence=useMemo(()=>orderedStimuliByBlocks(stimuli,blocks),[stimuli,blocks]);
@@ -5170,6 +5196,20 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
 
   const commitCurrentIdx=useCallback(idx=>{currentSeqIdxRef.current=idx;setCurrentSeqIdx(idx)},[]);
   const updateMediaBox=useCallback(()=>{const target=stimTypeRef.current==='video'?videoRef.current:imgRef.current,stage=mediaStageRef.current;if(!target||!stage)return;const r=getRenderedMediaRect(target,stage);if(!r||r.width<=0||r.height<=0)return;const next={left:r.left,top:r.top,width:r.width,height:r.height};setMediaBox(prev=>Math.abs(prev.left-next.left)<.5&&Math.abs(prev.top-next.top)<.5&&Math.abs(prev.width-next.width)<.5&&Math.abs(prev.height-next.height)<.5?prev:next)},[]);
+
+  const preloadStimulusAsset=useCallback(stim=>preloadEyeLabStimulusAsset(stim),[]);
+
+  const preloadBlockAt=useCallback(async(idx,{showScreen=false}={})=>{
+    const list=sequenceRef.current,first=list[idx];if(!first)return true;const blockItems=list.filter(s=>s._blockId===first._blockId),blockName=first._block?.name||'Block';
+    setPreloadError(null);setPreloadStatus({loaded:0,total:blockItems.length,blockName,ready:false});if(showScreen)setFlowState('preloading_block');
+    try{let loaded=0;await Promise.all(blockItems.map(item=>preloadStimulusAsset(item).then(asset=>{loaded++;setPreloadStatus({loaded,total:blockItems.length,blockName,ready:loaded===blockItems.length});return asset})));setPreloadStatus({loaded:blockItems.length,total:blockItems.length,blockName,ready:true});return true}
+    catch(e){setPreloadError(e?.message||String(e));if(showScreen)setFlowState('preload_error');return false}
+  },[preloadStimulusAsset]);
+
+  useEffect(()=>{
+    if(initialPreloadStartedRef.current||!sequence.length)return;initialPreloadStartedRef.current=true;preloadContextRef.current='initial';setPendingNextIdx(0);setSurveyBlock(sequence[0]?._block||null);
+    preloadBlockAt(0,{showScreen:true}).then(ok=>{if(!ok)return;setInitialBlockReady(true);setPendingNextIdx(null);setSurveyBlock(null);setFlowState('ready')});
+  },[sequence.length,preloadBlockAt]);
 
   useEffect(()=>{window.EyeLabBlockValidationResults=[]},[]);
   useEffect(()=>{const onFs=()=>{setIsFullscreen(!!document.fullscreenElement);setTimeout(updateMediaBox,80)};document.addEventListener('fullscreenchange',onFs);window.addEventListener('resize',updateMediaBox);return()=>{document.removeEventListener('fullscreenchange',onFs);window.removeEventListener('resize',updateMediaBox)}},[updateMediaBox]);
@@ -5208,11 +5248,15 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
 
   const requestStimulusFullscreen=useCallback(async()=>{try{if(document.fullscreenElement)return true;const target=containerRef.current||document.documentElement;if(target?.requestFullscreen){await target.requestFullscreen();return !!document.fullscreenElement}if(target?.webkitRequestFullscreen){target.webkitRequestFullscreen();return true}return false}catch(e){console.warn('Fullscreen unavailable',e);return false}},[]);
 
-  const startCurrentStimulus=useCallback(idx=>{
-    const list=sequenceRef.current,stim=list[idx];if(!stim)return;currentSeqIdxRef.current=idx;aoisRef.current=normalizeAoisForStimulus(stim);stimTypeRef.current=stim.type;stimDurationMsRef.current=Number(stim.displayDurationSec||DEFAULT_IMAGE_DURATION_SEC)*1000;gazeBufferRef.current=[];qualityRef.current={total:0,valid:0};setSampleCount(0);setLiveAoi(null);setStimTime(0);setMediaBox({left:0,top:0,width:0,height:0});setFlowState('stimulus');
+  const startCurrentStimulus=useCallback(async idx=>{
+    const list=sequenceRef.current,stim=list[idx];if(!stim)return;
+    try{await preloadStimulusAsset(stim)}catch(e){preloadContextRef.current='stimulus';setPendingNextIdx(idx);setSurveyBlock(stim._block||null);setPreloadError(e?.message||String(e));setFlowState('preload_error');return}
+    currentSeqIdxRef.current=idx;aoisRef.current=normalizeAoisForStimulus(stim);stimTypeRef.current=stim.type;stimDurationMsRef.current=Number(stim.displayDurationSec||DEFAULT_IMAGE_DURATION_SEC)*1000;gazeBufferRef.current=[];qualityRef.current={total:0,valid:0};setSampleCount(0);setLiveAoi(null);setStimTime(0);setMediaBox({left:0,top:0,width:0,height:0});setFlowState('stimulus');
     if(imageTimerRef.current){clearTimeout(imageTimerRef.current);imageTimerRef.current=null}
+    await new Promise(resolve=>requestAnimationFrame(resolve));if(currentSeqIdxRef.current!==idx)return;
+    if(stim.type!=='video'){const renderedImg=imgRef.current;try{if(renderedImg?.decode)await renderedImg.decode()}catch(e){}await new Promise(resolve=>requestAnimationFrame(resolve));if(currentSeqIdxRef.current!==idx)return}
     if(stim.type==='video'){
-      const v=videoRef.current;if(v){v.currentTime=0;startTimeRef.current=nowMs();isRecordingRef.current=true;setIsPlaying(true);setDuration(v.duration||stim.displayDurationSec);setTimeout(updateMediaBox,100);const pp=v.play();if(pp?.catch)pp.catch(()=>{})}
+      const v=videoRef.current;if(v){v.currentTime=0;try{const pp=v.play();if(pp)await pp}catch(e){preloadContextRef.current='stimulus';setPendingNextIdx(idx);setSurveyBlock(stim._block||null);setPreloadError(`Trình duyệt không thể phát video ${stim.name||''}: ${e?.message||String(e)}`);setFlowState('preload_error');return}startTimeRef.current=nowMs();isRecordingRef.current=true;setIsPlaying(true);setDuration(v.duration||stim.displayDurationSec);setTimeout(updateMediaBox,100)}
     }else{
       const imageDurationSec=Math.max(0.1,Number(stim.displayDurationSec)||DEFAULT_IMAGE_DURATION_SEC),imageDurationMs=imageDurationSec*1000;
       startTimeRef.current=nowMs();stimDurationMsRef.current=imageDurationMs;isRecordingRef.current=true;setIsPlaying(true);setDuration(imageDurationSec);setTimeout(updateMediaBox,100);
@@ -5224,7 +5268,7 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
       };
       imageTimerRef.current=setTimeout(checkImageDeadline,Math.min(100,imageDurationMs));
     }
-  },[updateMediaBox]);
+  },[preloadStimulusAsset,updateMediaBox]);
   useEffect(()=>{startCurrentStimulusRef.current=startCurrentStimulus},[startCurrentStimulus]);
 
   const resumeAt=useCallback(async idx=>{const enteredFullscreen=await requestStimulusFullscreen();if(!enteredFullscreen){alert('Trình duyệt chưa cho phép fullscreen. Hãy bấm lại nút Bắt đầu Block (Fullscreen) và cho phép toàn màn hình.');return}setSurveyBlock(null);setValidationResult(null);setPendingNextIdx(null);setShowFixation(true);setFlowState('transition');commitCurrentIdx(idx);setTimeout(()=>{setShowFixation(false);startCurrentStimulusRef.current?.(idx);advanceLockRef.current=false},800)},[commitCurrentIdx,requestStimulusFullscreen]);
@@ -5315,19 +5359,30 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
     }catch(e){fail('Không thể calibration lại: '+(e?.message||String(e)))}
   },[runQuickValidation,prepareNextBlock,stopTracker]);
 
+  const preloadAndStartTracker=useCallback(async(next,block)=>{
+    preloadContextRef.current='next_block';stopTracker();setPendingNextIdx(next);setSurveyBlock(block);const ready=await preloadBlockAt(next,{showScreen:true});if(!ready)return false;startTrackerForNextBlock(next,block);return true;
+  },[preloadBlockAt,startTrackerForNextBlock,stopTracker]);
+
   const recalibrateAndRetry=useCallback(()=>startTrackerForNextBlock(pendingNextIdx,surveyBlock),[pendingNextIdx,surveyBlock,startTrackerForNextBlock]);
 
   const finishSession=useCallback(()=>{stopTracker();setSurveyBlock(null);setPendingNextIdx(null);commitCurrentIdx(sequenceRef.current.length);setIsPlaying(false);setFlowState('done');try{if(document.fullscreenElement)document.exitFullscreen()}catch(e){}setTimeout(()=>{if(!finalizedRef.current){finalizedRef.current=true;onNext()}},250)},[commitCurrentIdx,onNext,stopTracker]);
 
-  const showSurvey=useCallback(async(block,nextIdx)=>{stopTracker();setIsPlaying(false);setLiveAoi(null);setPendingNextIdx(nextIdx);setSurveyBlock(block);surveyCompletionLockRef.current=false;try{if(document.fullscreenElement)await document.exitFullscreen()}catch(e){}setFlowState('survey')},[stopTracker]);
+  const showSurvey=useCallback(async(block,nextIdx)=>{stopTracker();setIsPlaying(false);setLiveAoi(null);setPendingNextIdx(nextIdx);setSurveyBlock(block);surveyCompletionLockRef.current=false;try{if(document.fullscreenElement)await document.exitFullscreen()}catch(e){}setFlowState('survey');if(nextIdx<sequenceRef.current.length)preloadBlockAt(nextIdx).catch(()=>{})},[preloadBlockAt,stopTracker]);
 
-  const completeSurvey=useCallback(()=>{
+  const completeSurvey=useCallback(async()=>{
     if(surveyCompletionLockRef.current)return;
     surveyCompletionLockRef.current=true;
     const next=pendingNextIdx,block=surveyBlock;
     if(next==null||next>=sequenceRef.current.length){finishSession();return}
-    startTrackerForNextBlock(next,block);
-  },[pendingNextIdx,surveyBlock,finishSession,startTrackerForNextBlock]);
+    const started=await preloadAndStartTracker(next,block);if(!started)surveyCompletionLockRef.current=false;
+  },[pendingNextIdx,surveyBlock,finishSession,preloadAndStartTracker]);
+
+  const retryPreload=useCallback(async()=>{
+    const idx=pendingNextIdx??0,context=preloadContextRef.current;if(context==='stimulus'){setFlowState('transition');startCurrentStimulusRef.current?.(idx);return}
+    const ready=await preloadBlockAt(idx,{showScreen:true});if(!ready)return;
+    if(context==='initial'){setInitialBlockReady(true);setPendingNextIdx(null);setSurveyBlock(null);setFlowState('ready');return}
+    startTrackerForNextBlock(idx,surveyBlock);
+  },[pendingNextIdx,preloadBlockAt,startTrackerForNextBlock,surveyBlock]);
 
   useEffect(()=>{
     const onMsg=e=>{
@@ -5347,10 +5402,10 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
       const b=cur?._block||normalizeBlocks(blocks,stimuli).find(x=>x.id===cur?._blockId);
       if(b?.surveyUrl){showSurvey(b,next);return}
       if(isFinal){finishSession();return}
-      startTrackerForNextBlock(next,b);return;
+      preloadAndStartTracker(next,b);return;
     }
     setShowFixation(true);setIsPlaying(false);setLiveAoi(null);setFlowState('transition');setTimeout(()=>{setShowFixation(false);commitCurrentIdx(next);setSampleCount(0);setStimTime(0);setMediaBox({left:0,top:0,width:0,height:0});gazeBufferRef.current=[];setTimeout(()=>{startCurrentStimulusRef.current?.(next);advanceLockRef.current=false},120)},800)
-  },[persistCurrent,finishSession,blocks,stimuli,showSurvey,startTrackerForNextBlock,commitCurrentIdx]);
+  },[persistCurrent,finishSession,blocks,stimuli,showSurvey,preloadAndStartTracker,commitCurrentIdx]);
   useEffect(()=>{advanceStimulusRef.current=advanceStimulus},[advanceStimulus]);
 
   useEffect(()=>{const stim=sequence[currentSeqIdx];if(!stim||stim.type!=='video'||flowState!=='stimulus')return;const v=videoRef.current;if(!v)return;const onTime=()=>{setStimTime(v.currentTime);updateMediaBox()},onLoad=()=>{setDuration(v.duration||stim.displayDurationSec);setTimeout(updateMediaBox,60)},onEnd=()=>advanceStimulusRef.current?.();v.addEventListener('timeupdate',onTime);v.addEventListener('loadedmetadata',onLoad);v.addEventListener('loadeddata',onLoad);v.addEventListener('ended',onEnd);return()=>{v.removeEventListener('timeupdate',onTime);v.removeEventListener('loadedmetadata',onLoad);v.removeEventListener('loadeddata',onLoad);v.removeEventListener('ended',onEnd)}},[currentSeqIdx,sequence,flowState,updateMediaBox]);
@@ -5362,10 +5417,12 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
 
   const stim=currentSeqIdx>=0&&currentSeqIdx<sequence.length?sequence[currentSeqIdx]:null,progress=duration?Math.min(100,(stimTime/duration)*100):0,safeIdx=Math.max(0,Math.min(currentSeqIdx,sequence.length)),overallProgress=sequence.length?((safeIdx+(progress/100))/sequence.length)*100:0;
 
+  if(flowState==='preloading_block'||flowState==='preload_error'){const pct=preloadStatus.total?Math.round(preloadStatus.loaded/preloadStatus.total*100):0;return <div className="fixed inset-0 z-[24000] bg-white text-black flex items-center justify-center"><div className="text-center max-w-xl w-full px-6"><div className="font-mono text-xs text-black/50 uppercase tracking-widest mb-5">EyeLab · Stimulus preload</div>{flowState==='preload_error'?<><h2 className="text-3xl font-semibold mb-3">Không tải được stimulus</h2><p className="text-red-600 mb-6 font-mono text-sm">{preloadError||'Lỗi tải media không xác định.'}</p><button onClick={retryPreload} className="btn-primary">↻ Thử tải lại</button></>:<><h2 className="text-3xl font-semibold mb-3">Đang chuẩn bị {preloadStatus.blockName||'Block'}…</h2><p className="text-black/60 mb-5">EyeLab đang tải và giải mã media trước khi ghi gaze. Thời gian tải này không được tính vào thời lượng stimulus.</p><div className="h-2 bg-black/10 overflow-hidden mb-3"><div className="h-full bg-amber-500 transition-all" style={{width:`${pct}%`}}></div></div><div className="font-mono text-xs text-black/50">{preloadStatus.loaded}/{preloadStatus.total} stimulus · {pct}%</div></>}</div></div>}
+
   if(flowState==='survey'&&surveyBlock){return <div>
     <div className="font-mono text-[10px] text-[var(--accent)] uppercase tracking-[0.3em] mb-4">SURVEY GATE / {surveyBlock.name}</div><h2 className="font-display text-4xl mb-2">{surveyBlock.surveyTitle||'Khảo sát'}</h2><p className="text-[var(--text-2)] mb-4">GazeCloud đã <span className="text-[var(--success)] font-mono">STOPPED</span> hoàn toàn trong lúc làm khảo sát. Sau khi hoàn tất, EyeLab sẽ mở một tracking session mới và calibration lại trước Block kế tiếp.</p>
     <div className="panel overflow-hidden"><iframe ref={surveyIframeRef} title={surveyBlock.surveyTitle||'Survey'} src={surveyBlock.surveyUrl} style={{width:'100%',height:'70vh',border:0,background:'#fff'}} /></div>
-    <div className="mt-4 flex justify-between items-center gap-3"><div className="font-mono text-[10px] text-[var(--text-3)]">Survey responses không được EyeLab đọc hoặc lưu.{surveyBlock.surveyAutoDetect===true?' Form tùy chỉnh có thể tự chuyển bằng postMessage đã xác thực.':''}</div><button onClick={completeSurvey} className="btn-primary">✓ Tôi đã hoàn tất khảo sát → Tiếp tục</button></div>
+    <div className="mt-4 flex justify-between items-center gap-3"><div className="font-mono text-[10px] text-[var(--text-3)]">Survey responses không được EyeLab đọc hoặc lưu.{surveyBlock.surveyAutoDetect===true?' Form tùy chỉnh có thể tự chuyển bằng postMessage đã xác thực.':''}{preloadStatus.total?` · Block tiếp theo: ${preloadStatus.loaded}/${preloadStatus.total} media đã sẵn sàng.`:''}</div><button onClick={completeSurvey} className="btn-primary">✓ Tôi đã hoàn tất khảo sát → Tiếp tục</button></div>
   </div>}
 
   if(flowState==='recalibration_handoff'){return <div className="fixed inset-0 z-[50] bg-white text-black flex items-end justify-center pb-8"><div className="font-mono text-xs text-black/40">Đang bắt đầu tracking session cho Block kế tiếp — giữ khuôn mặt trong khung camera và bấm Start Gaze Calibration khi nút sáng lên.</div></div>}
@@ -5378,10 +5435,10 @@ function RecordingPhase({onNext,stimuli,blocks,updateStimulus}){
   return(<div>
     <div className="font-mono text-[10px] text-[var(--accent)] uppercase tracking-[0.3em] mb-4 flex items-center gap-2">{isPlaying&&<span className="w-2 h-2 bg-[var(--danger)] rounded-full rec-dot"></span>}GAZE RECORDING · {sequence.length} STIMULI · {normalizeBlocks(blocks,stimuli).length} BLOCKS</div>
     <h2 className="font-display text-4xl mb-2">{currentSeqIdx<0?'Sẵn sàng ghi dữ liệu':isPlaying?<>Đang <span className="italic text-[var(--accent)]">ghi dữ liệu</span>…</>:'Chuyển bước'}</h2>{stim&&<div className="font-mono text-xs text-[var(--text-2)] mb-6">{stim._block?.name} · Stimulus #{currentSeqIdx+1} · {stim.name}</div>}
-    <div className="grid grid-cols-12 gap-6"><div className="col-span-12 lg:col-span-9"><div ref={containerRef} className={isFullscreen?'rec-fs':'panel relative'}>{!isFullscreen&&<div className="panel-header"><span>Live Stimulus</span><span>{stim?`#${currentSeqIdx+1}/${sequence.length}`:'—'} · {fmt(stimTime,2)}s / {fmt(duration,2)}s</span></div>}<div ref={mediaStageRef} className="relative bg-black" style={isFullscreen?{width:'100%',height:'100%',display:'flex',alignItems:'center',justifyContent:'center'}:{}}>{showFixation?<div style={{minHeight:'40vh',width:'100%',display:'flex',alignItems:'center',justifyContent:'center'}}><div className="font-display text-7xl text-[var(--accent)]">+</div></div>:stim?(stim.type==='video'?<video ref={videoRef} src={stim.url} className="block" style={isFullscreen?{width:'100%',height:'100%',objectFit:'contain'}:{width:'100%',height:'65vh',objectFit:'contain'}}/>:<img ref={imgRef} src={stim.url} className="block" style={isFullscreen?{width:'100%',height:'100%',objectFit:'contain'}:{width:'100%',height:'65vh',objectFit:'contain'}} draggable={false}/>):<div style={{minHeight:'40vh',width:'100%',display:'flex',alignItems:'center',justifyContent:'center'}} className="font-mono text-[var(--text-3)]">[chưa bắt đầu]</div>}</div>{!isFullscreen&&<div className="h-1 bg-[var(--bg)]"><div className="h-full bg-[var(--accent)]" style={{width:`${progress}%`}}></div></div>}{isFullscreen&&<><div className="rec-fs-status"><span className="w-2 h-2 bg-[var(--danger)] rounded-full rec-dot"></span><span>REC</span><span>· {stim?stim._block?.name:''}</span><span>· #{currentSeqIdx+1}/{sequence.length}</span><span>· {fmt(stimTime,1)}s/{fmt(duration,1)}s</span><span>· Samples {sampleCount}</span></div><div className="rec-fs-controls"><span className="font-mono text-[10px]">Overall {fmt(overallProgress,0)}%</span><button onClick={stopAll} className="btn-danger">⏹ DỪNG</button><button onClick={exitFullscreen} className="btn-ghost">Thoát fullscreen</button></div></>}</div><div ref={dotRef} className="gaze-dot" style={{display:'none'}}></div></div>
+    <div className="grid grid-cols-12 gap-6"><div className="col-span-12 lg:col-span-9"><div ref={containerRef} className={isFullscreen?'rec-fs':'panel relative'}>{!isFullscreen&&<div className="panel-header"><span>Live Stimulus</span><span>{stim?`#${currentSeqIdx+1}/${sequence.length}`:'—'} · {fmt(stimTime,2)}s / {fmt(duration,2)}s</span></div>}<div ref={mediaStageRef} className="relative bg-black" style={isFullscreen?{width:'100%',height:'100%',display:'flex',alignItems:'center',justifyContent:'center'}:{}}>{showFixation?<div style={{minHeight:'40vh',width:'100%',display:'flex',alignItems:'center',justifyContent:'center'}}><div className="font-display text-7xl text-[var(--accent)]">+</div></div>:stim?(stim.type==='video'?<video ref={videoRef} src={stim.url} preload="auto" playsInline className="block" style={isFullscreen?{width:'100%',height:'100%',objectFit:'contain'}:{width:'100%',height:'65vh',objectFit:'contain'}}/>:<img ref={imgRef} src={stim.url} decoding="sync" className="block" style={isFullscreen?{width:'100%',height:'100%',objectFit:'contain'}:{width:'100%',height:'65vh',objectFit:'contain'}} draggable={false}/>):<div style={{minHeight:'40vh',width:'100%',display:'flex',alignItems:'center',justifyContent:'center'}} className="font-mono text-[var(--text-3)]">[chưa bắt đầu]</div>}</div>{!isFullscreen&&<div className="h-1 bg-[var(--bg)]"><div className="h-full bg-[var(--accent)]" style={{width:`${progress}%`}}></div></div>}{isFullscreen&&<><div className="rec-fs-status"><span className="w-2 h-2 bg-[var(--danger)] rounded-full rec-dot"></span><span>REC</span><span>· {stim?stim._block?.name:''}</span><span>· #{currentSeqIdx+1}/{sequence.length}</span><span>· {fmt(stimTime,1)}s/{fmt(duration,1)}s</span><span>· Samples {sampleCount}</span></div><div className="rec-fs-controls"><span className="font-mono text-[10px]">Overall {fmt(overallProgress,0)}%</span><button onClick={stopAll} className="btn-danger">⏹ DỪNG</button><button onClick={exitFullscreen} className="btn-ghost">Thoát fullscreen</button></div></>}</div><div ref={dotRef} className="gaze-dot" style={{display:'none'}}></div></div>
       <div className="col-span-12 lg:col-span-3"><div className="panel mb-4"><div className="panel-header"><span>Live Telemetry</span><span>/ RT</span></div><div className="p-5 space-y-4"><Stat label="Block" value={stim?stim._block?.name:'—'} mono/><Stat label="Current Stim" value={stim?`#${currentSeqIdx+1}/${sequence.length}`:'—'} mono/><Stat label="Samples" value={sampleCount} mono/><Stat label="Live AOI" value={liveAoi||'—'} mono/><Stat label="Overall" value={fmt(overallProgress,0)+'%'} mono/></div></div>
         <div className="panel mb-4"><div className="panel-header"><span>Block sequence</span><span>/ FLOW</span></div><div className="max-h-[300px] overflow-y-auto">{normalizeBlocks(blocks,stimuli).map(b=><div key={b.id} className="p-3 border-b border-[var(--border)]"><div className="text-xs font-medium">{b.order}. {b.name}</div><div className="font-mono text-[9px] text-[var(--text-3)]">{sequence.filter(s=>s._blockId===b.id).length} stim {b.surveyUrl?'→ survey':''}</div></div>)}</div></div>
-        {currentSeqIdx<0&&<button onClick={beginSession} className="btn-primary w-full" style={{padding:'14px'}}>● Bắt đầu (Fullscreen)</button>}{isPlaying&&<button onClick={stopAll} className="btn-danger w-full">⏹ Kết thúc sớm</button>}
+        {currentSeqIdx<0&&<button onClick={beginSession} disabled={!initialBlockReady} className="btn-primary w-full" style={{padding:'14px'}}>{initialBlockReady?'● Bắt đầu (Fullscreen)':'Đang tải stimulus…'}</button>}{isPlaying&&<button onClick={stopAll} className="btn-danger w-full">⏹ Kết thúc sớm</button>}
       </div></div>
   </div>);
 }
@@ -5964,7 +6021,7 @@ function App(){
     if(phase==='aoi')return <Shell phase="aoi"><FloatingHomeButton onClick={backToMode}/>{adminBar}<AoiPhase onNext={async()=>{await saveCurrentProject();setPhase('admin_done')}} stimuli={stimuli} updateStimulus={updateStimulus} onEditStimuli={()=>setPhase('upload')} onCreateProject={createNewProject} onSaveProject={saveCurrentProject} projectInfo={projectInfo} onProjectNameChange={setProjectName}/><AdminRemotePanel stimuli={stimuli} blocks={blocks} projectInfo={projectInfo} onRemoteMetaChange={onRemoteMetaChange}/><AdminTestDataPanel projectInfo={projectInfo}/></Shell>;
     return <AdminComplete stimuli={stimuli} blocks={blocks} projectInfo={projectInfo} onProjectNameChange={setProjectName} onBack={()=>setPhase('aoi')} onEditStimuli={()=>setPhase('upload')} onUser={enterUser} onCreateProject={createNewProject} onSaveProject={saveCurrentProject} projects={projects} onSelectProject={selectProject} onDeleteProject={deleteProjectFlow} onImportProject={importProjectFlow} onHome={backToMode} onRemoteMetaChange={onRemoteMetaChange}/>;
   }
-  return <Shell phase={phase}>{!projectInfo.isRemote&&phase!=='calibration'&&<FloatingHomeButton onClick={backToMode}/>} {!projectInfo.isRemote&&<div className="mb-4 flex justify-end"><button onClick={backToMode} className="btn-ghost">← Chọn lại mode</button></div>}{projectInfo.isRemote&&<div className="mb-4 panel p-3 font-mono text-[10px] text-[var(--text-2)]">REMOTE STUDY · {projectInfo.name} · responses survey không lưu trong EyeLab</div>}{phase==='welcome'&&<WelcomePhase onNext={()=>setPhase('calibration')} demographics={demographics} setDemographics={setDemographics}/>} {phase==='calibration'&&<CalibrationPhase onNext={()=>setPhase('recording')} gazeReady={gazeReady} setGazeReady={setGazeReady}/>} {phase==='recording'&&<RecordingPhase onNext={()=>setPhase('results')} stimuli={stimuli} blocks={blocks} updateStimulus={updateStimulus}/>} {phase==='results'&&<ResultsPhase sessionId={sessionId} demographics={demographics} stimuli={stimuli} onRestart={restartUser} projectInfo={projectInfo}/>}</Shell>;
+  return <Shell phase={phase}>{!projectInfo.isRemote&&phase!=='calibration'&&<FloatingHomeButton onClick={backToMode}/>} {!projectInfo.isRemote&&<div className="mb-4 flex justify-end"><button onClick={backToMode} className="btn-ghost">← Chọn lại mode</button></div>}{projectInfo.isRemote&&<div className="mb-4 panel p-3 font-mono text-[10px] text-[var(--text-2)]">REMOTE STUDY · {projectInfo.name} · responses survey không lưu trong EyeLab</div>}{phase==='welcome'&&<WelcomePhase onNext={()=>setPhase('preload')} demographics={demographics} setDemographics={setDemographics}/>} {phase==='preload'&&<ParticipantPreloadPhase stimuli={stimuli} blocks={blocks} onNext={()=>setPhase('calibration')}/>} {phase==='calibration'&&<CalibrationPhase onNext={()=>setPhase('recording')} gazeReady={gazeReady} setGazeReady={setGazeReady}/>} {phase==='recording'&&<RecordingPhase onNext={()=>setPhase('results')} stimuli={stimuli} blocks={blocks} updateStimulus={updateStimulus}/>} {phase==='results'&&<ResultsPhase sessionId={sessionId} demographics={demographics} stimuli={stimuli} onRestart={restartUser} projectInfo={projectInfo}/>}</Shell>;
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App />);
